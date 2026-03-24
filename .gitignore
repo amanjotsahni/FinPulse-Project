@@ -1,0 +1,18 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDEs
+.vscode/
+
+# Data and large files (Critical for FinPulse since dataset is 6m+ rows)
+data/
+*.csv
+*.parquet
