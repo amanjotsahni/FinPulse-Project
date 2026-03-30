@@ -1,9 +1,13 @@
 FROM python:3.10-slim
 
+# Install uv directly from the official astral container
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    HEADLESS_MODE=1
+    HEADLESS_MODE=1 \
+    UV_SYSTEM_PYTHON=1
 
 WORKDIR /app
 
@@ -12,9 +16,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     && rm -rf /var/lib/apt/lists/*
 
-# Install python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Install python dependencies strictly bounded by lock file
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-install-project --no-cache
 
 # Copy application source code
 COPY . /app
