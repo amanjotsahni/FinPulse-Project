@@ -1,6 +1,14 @@
 import pandas as pd 
 import os
+import sys
 from datetime import datetime
+
+# Add project root to path manually to ensure config can be imported securely when run as script
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.append(PROJECT_ROOT)
+
+from config import RAW_TRANSACTIONS_PATH, BRONZE_TRANSACTIONS, PIPELINE_VERSION, DATA_SOURCE_TRANSACTIONS
 
 # ============================================================
 # FinPulse — Bronze Layer Ingestion
@@ -9,8 +17,6 @@ from datetime import datetime
 # Author: Amanjot Kaur
 # ============================================================
 
-RAW_DATA_PATH = r"C:\Users\amana\Downloads\Finance data\Finance_dataset.csv"
-BRONZE_OUTPUT_PATH = r"C:\FinPulse Project\data\bronze\transactions"
 INGESTION_TIMESTAMP = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def load_raw_transactions(file_path):
@@ -33,8 +39,8 @@ def add_metadata(df):
     Tracks ingestion timestamp and source for data lineage.
     """
     df['ingestion_timestamp']= INGESTION_TIMESTAMP
-    df['data_source'] = 'kaggle_paysim'
-    df['pipeline_version'] = 'v1.0'
+    df['data_source'] = DATA_SOURCE_TRANSACTIONS
+    df['pipeline_version'] = PIPELINE_VERSION
 
     return df 
 
@@ -68,11 +74,11 @@ def run_bronze_ingestion():
     print("="*60)
 
     # Step 1 - Load raw data
-    df = load_raw_transactions(RAW_DATA_PATH)
+    df = load_raw_transactions(RAW_TRANSACTIONS_PATH)
     # Step 2 - Add metadata
     df = add_metadata(df)
     # Step 3 - Save to Bronze layer
-    output_file = save_bronze_layer(df, BRONZE_OUTPUT_PATH)
+    output_file = save_bronze_layer(df, BRONZE_TRANSACTIONS)
 
     print("\n" + "=" * 60)
     print("BRONZE INGESTION COMPLETE")

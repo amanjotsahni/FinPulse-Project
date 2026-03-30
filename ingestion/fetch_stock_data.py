@@ -1,6 +1,8 @@
 import os
 import time
 import random
+from dotenv import load_dotenv
+load_dotenv()
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -24,8 +26,16 @@ def _patched_request(self, method, url, **kwargs):
 requests.Session.request = _patched_request
 
 import yfinance as yf 
+import sys
 import pandas as pd
 from datetime import datetime
+
+# Add project root to path manually to ensure config can be imported securely when run as script
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.append(PROJECT_ROOT)
+
+from config import BRONZE_STOCKS, TICKERS, STOCK_PERIOD, DATA_SOURCE_STOCKS
 
 # ============================================================
 # FinPulse — Stock Market Data Ingestion (Bronze Layer)
@@ -33,9 +43,6 @@ from datetime import datetime
 # Author: Amanjot Kaur
 # ============================================================
 
-TICKERS = ["AAPL","GOOGL","MSFT","JPM","GS"]
-PERIOD = "2y"
-BRONZE_STOCK_PATH = r"C:\FinPulse Project\data\bronze\stocks"
 INGESTION_TIMESTAMP = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def fetch_stock_data(tickers, period):
@@ -68,7 +75,7 @@ def fetch_stock_data(tickers, period):
         df = df.reset_index()
         df['ticker'] = ticker
         df['ingestion_timestamp']=INGESTION_TIMESTAMP
-        df['data_source']='yahoo_finance'
+        df['data_source']=DATA_SOURCE_STOCKS
 
         all_stocks.append(df)
         print(f" {ticker}:{len(df)} records fetched")
@@ -116,10 +123,10 @@ def run_stock_ingestion():
     print("="*60)
 
     # Step 1: Fetch from Yahoo Finance
-    df = fetch_stock_data(TICKERS, PERIOD)
+    df = fetch_stock_data(TICKERS, STOCK_PERIOD)
 
     # Step 2: Save to Bronze Layer
-    output_file = save_stock_bronze(df, BRONZE_STOCK_PATH)
+    output_file = save_stock_bronze(df, BRONZE_STOCKS)
 
     print("\n" + "=" *60)
     print("STOCK INGESTION COMPLETE")

@@ -4,10 +4,14 @@ import time
 import webbrowser
 import subprocess
 import atexit
+from dotenv import load_dotenv
+
+load_dotenv()
+PREFECT_UI_PORT = os.getenv("PREFECT_UI_PORT", "8200")
 
 print("Starting temporary Prefect UI server...")
 server_process = subprocess.Popen(
-    "prefect server start --port 8200", 
+    f"prefect server start --port {PREFECT_UI_PORT}", 
     shell=True,
     stdout=subprocess.DEVNULL,
     stderr=subprocess.DEVNULL
@@ -20,10 +24,12 @@ def cleanup_server():
 atexit.register(cleanup_server)
 
 # Point script to this new server
-os.environ["PREFECT_API_URL"] = "http://127.0.0.1:8200/api"
+os.environ["PREFECT_API_URL"] = os.getenv("PREFECT_API_URL", f"http://127.0.0.1:{PREFECT_UI_PORT}/api")
 time.sleep(5)  # Let server boot up
 
-sys.path.append(r"C:\FinPulse Project")
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.append(PROJECT_ROOT)
 
 from prefect import flow, task
 from prefect.tasks import task_input_hash
@@ -71,11 +77,12 @@ def finpulse_bronze_flow():
       Main Prefect flow - orchestrates full Bronze ingestion.
       Tasks run sequentially-transactions first, then stocks.
       """
-      # Open browser to the UI as soon as the flow starts
-      try:
-            webbrowser.open("http://127.0.0.1:8200/runs")
-      except Exception:
-            pass
+      # Open browser to the UI as soon as the flow starts (skip if running in headless/docker env)
+      if not os.environ.get("HEADLESS_MODE"):
+            try:
+                  webbrowser.open(f"http://127.0.0.1:{PREFECT_UI_PORT}/runs")
+            except Exception:
+                  pass
 
       print("="*60)
       print("FINPULSE PIPELINE STARTING")

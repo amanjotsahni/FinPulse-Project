@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  finpulse-pipeline:
+    build: .
+    container_name: finpulse-pipeline
+    env_file:
+      - .env
+    volumes:
+      # Map the local data directory to container, so fetched data is persistent locally
+      - ./data:/app/data
+    ports:
+      - "8200:8200"
+    restart: "no"
