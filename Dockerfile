@@ -26,5 +26,9 @@ COPY . /app
 # Ensure correct path resolution
 ENV PYTHONPATH=/app
 
+# Run as non-root for security
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
 # Default command to run the pipeline
 CMD ["python", "prefect_flows/finpulse_pipeline.py"]

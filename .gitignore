@@ -1,21 +1,34 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
+# Google Drive temp files
+.tmp.driveupload/
+*.driveupload
+.dropbox
+.dropbox.cache
 
-# Virtual Environments
+# Parquet and data files
+*.parquet
+data/silver/
+data/gold/
+data/ai_reports/
+hadoop/
+
+# Large files
+*.csv
+*.db
+*.dbc
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
 .venv/
 venv/
-ENV/
-env/
 
-# Environment Variables
+# Spark
+derby.log
+metastore_db/
+spark-warehouse/
+
+# Environment
 .env
-
-# IDEs
-.vscode/
-
-# Data and large files (Critical for FinPulse since dataset is 6m+ rows)
-data/
-*.csv
-*.parquet
+credentials.json
+token.json
