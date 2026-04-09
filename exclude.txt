@@ -1,0 +1,1 @@
+exclude org/apache/iceberg/shaded/org/apache/arrow/memory/ArrowBuf <init>

@@ -32,3 +32,22 @@ spark-warehouse/
 .env
 credentials.json
 token.json
+
+# IDE and Agent Metadata
+.agents/
+.claude/
+.cursor/
+.gemini/
+.ai-dev-kit/
+.vscode/
+.ipynb_checkpoints/
+
+# Data & Warehouse (Preserve project structure, ignore content)
+data/
+!data/.gitkeep
+.tmp.drivedownload/
+.tmp.driveupload/
+
+# Debug artifacts (Keep local, ignore in Git)
+scratch/
+syspath.txt

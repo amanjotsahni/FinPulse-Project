@@ -15,11 +15,12 @@ dependencies = [
     "comm>=0.2.3",
     "jupyter>=1.1.1",
     "ipykernel>=7.2.0",
+    "pyarrow>=23.0.1",
 ]
 
 [project.optional-dependencies]
 # Install for Silver/Gold notebook work: uv sync --extra notebook
 notebook = [
-    "pyspark>=3.5.0",
+    "pyspark>=3.5.0,<4.0.0",
     "pyiceberg>=0.5.0",
 ]

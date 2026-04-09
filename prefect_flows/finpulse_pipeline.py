@@ -4,6 +4,7 @@ import time
 import webbrowser
 import subprocess
 import atexit
+from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -16,9 +17,12 @@ if PROJECT_ROOT not in sys.path:
 from config import get_logger
 logger = get_logger(__name__)
 
+# Resolve prefect CLI relative to current Python executable (works with or without activated venv)
+PREFECT_BIN = str(Path(sys.executable).parent / "prefect")
+
 logger.info("Starting temporary Prefect UI server...")
 server_process = subprocess.Popen(
-    ["prefect", "server", "start", "--port", PREFECT_UI_PORT],
+    [PREFECT_BIN, "server", "start", "--port", PREFECT_UI_PORT],
     stdout=subprocess.DEVNULL,
     stderr=subprocess.DEVNULL,
 )
