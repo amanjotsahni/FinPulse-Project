@@ -12,10 +12,37 @@ A layered pattern where data quality increases at each layer. Data only moves fo
 |---|---|---|---|
 | Bronze | Raw | Immutable, as-is from source | Hive-partitioned CSV (`date=YYYY-MM-DD`) |
 | Silver | Cleaned & Enriched | Schema-enforced, feature-engineered | Apache Iceberg v2 (Snappy Parquet) |
-| Gold | Business-Ready | Aggregated, modeled for BI/ML | dbt models (planned) |
+| Gold | Business-Ready | Aggregated, modeled for BI/ML | Databricks Delta Lake (via dbt) |
 
 **Why immutable Bronze?**  
 If a Silver bug is found, you reprocess from Bronze — no need to go back to the source system. Bronze is the source of truth. It is **append-only**; never update, never delete.
+
+### FinPulse Ingestion Architecture (Actual)
+```
+[Yahoo Finance API / PaySim CSV]
+          ↓
+    Bronze (Local)
+  Hive-partitioned CSV
+   date=YYYY-MM-DD/
+          ↓
+   PySpark Silver (Local)
+  Apache Iceberg v2 table
+  (ACID + time-travel)
+          ↓
+   Parquet Export (Local)
+   data/silver/transactions/
+   data/silver/stocks/
+          ↓
+  Databricks SDK Upload
+  /Volumes/workspace/finpulse/staging/
+          ↓
+  CREATE TABLE AS SELECT (CTAS)
+  workspace.finpulse.transactions_silver  (Delta)
+  workspace.finpulse.stocks_silver        (Delta)
+          ↓
+   dbt Gold Models (Databricks SQL Warehouse)
+     9 tables: fraud KPIs, volatility, moving averages...
+```
 
 ---
 
@@ -400,17 +427,43 @@ JVM_OPTS = f' -Djava.io.tmpdir="{spark_temp_path}"'  # then use
 - **Interview point:** *"A dead JVM cannot be recovered from the same Python process. Kernel restart flushes all Python objects including the stale gateway reference."*
 
 ### Bug 6: `FileNotFoundError` for Timestamped Bronze Files
-**Symptom:** Ingestion fails because it looks for `stocks_raw.csv` but the source system provided `stocks_raw_185807.csv`.  
-**Root Cause:** Yahoo Finance (or other APIs) often append a timestamp or request ID to the filename. Hardcoded paths fail as soon as the timestamp changes.  
-**Fix (Robust Path Detection):**
+**Symptom:** `FileNotFoundError: stocks_raw.csv` — pipeline fails if run after a fresh API pull that appended a timestamp.
+**Root Cause:** Yahoo Finance appends a request timestamp to downloaded filenames: `stocks_raw_185807.csv`. Hardcoded path `stocks_raw.csv` breaks the moment the filename changes.
+**Fix:**
 ```python
 target_file = os.path.join(partition_dir, "stocks_raw.csv")
 if not os.path.exists(target_file):
-    csv_files = sorted([f for f in os.listdir(partition_dir) if f.endswith(".csv")])
+    csv_files = sorted(f for f in os.listdir(partition_dir) if f.endswith(".csv"))
     if csv_files:
-        target_file = os.path.join(partition_dir, csv_files[-1]) # Pick latest
+        target_file = os.path.join(partition_dir, csv_files[-1])  # latest by name
 ```
-**Interview Point:** *"I built a self-healing ingestion pattern that auto-detects the latest file in a partition if the standard name is missing — significantly reducing manual pipeline interventions."*
+**Interview point:** *"Hardcoded filenames are a pipeline fragility anti-pattern. The fix is a self-healing resolver — check canonical name first, fall back to latest file in partition. Zero manual intervention needed on API filename drift."*
+
+### Bug 7: dbt `ref()` vs `source()` — Missing Source Registration
+**Symptom:** `dbt run` fails: `Model 'model.dbt_finpulse.daily_stock_summary' depends on a node named 'stocks_silver' which was not found.`  
+**Root Cause:** All 9 Gold models used `{{ ref('stocks_silver') }}` / `{{ ref('transactions_silver') }}`. `ref()` tells dbt to look for a model it manages internally. Silver tables were pushed externally (via Python SDK) — dbt had no knowledge of them without a `sources.yml` declaration.  
+**Fix:**
+1. Created `models/sources.yml` declaring both silver tables as external sources:
+   ```yaml
+   sources:
+     - name: finpulse
+       database: workspace
+       schema: finpulse
+       tables:
+         - name: transactions_silver
+         - name: stocks_silver
+   ```
+2. Replaced every `ref(...)` call with `source('finpulse', ...)` across all 9 Gold SQL files.  
+**Interview point:** *"`ref()` is for dbt-managed models in the project DAG. `source()` is for externally-managed tables. Getting this wrong breaks lineage, causes compilation errors, and prevents impact analysis. Understanding this distinction is a core dbt competency."*
+
+### Bug 8: Databricks SQL Boolean Aggregation Type Error
+**Symptom:** `[DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve sum(is_balance_discrepancy) due to BOOLEAN type.`  
+**Root Cause:** `is_balance_discrepancy` was engineered as a BOOLEAN column in the Silver Parquet. Databricks SQL (Delta Lake) follows ANSI SQL strictly — `SUM()` over BOOLEAN is undefined in ANSI SQL and thus rejected. Other SQL engines (PostgreSQL, BigQuery) implicitly cast BOOLEAN to integer for aggregation; Databricks does not.  
+**Fix:** Explicit CAST before aggregation in all affected Gold SQL models:
+```sql
+SUM(CAST(is_balance_discrepancy AS INT)) AS discrepancy_count
+```
+**Interview point:** *"SQL dialect differences in type strictness are a real production pain point. Databricks follows ANSI SQL more closely than many other engines. Always test Gold SQL on the actual target engine, not assumptions from another dialect."*
 
 ---
 
@@ -593,90 +646,244 @@ def validate_silver_data(df):
 ## 8. System Design Patterns Used
 
 ### Idempotency
-`createOrReplace()` is idempotent — rerunning the pipeline produces the same table state. Essential for retry logic (Prefect retries won't duplicate data).
+`createOrReplace()` is idempotent — rerunning the pipeline produces the same table state. Essential for retry logic (Prefect retries won't duplicate data). Applied at both Silver (Iceberg `createOrReplace`) and Gold (dbt `--full-refresh`).
 
-### Stage-then-Sync (Decoupled I/O Pattern)
-1. Spark writes to strongly-consistent local storage (atomic NTFS operations).
-2. `shutil.copytree()` copies the finalized table to eventual-consistency cloud storage.
-Never mix transactional writes with sync-agent-watched directories.
+### Stage-then-Sync (Decoupled I/O Pattern) — Local Storage
+1. PySpark writes to strongly-consistent local NTFS (atomic Iceberg snapshots).
+2. Parquet export copies finalized data to `data/silver/` outside the Iceberg warehouse.
+Never mix transactional Spark writes with sync-agent-watched directories (Google Drive).
+
+### Stage-then-Atomic-Load — Cloud Ingestion
+1. Local Parquet files already on disk (prior step output).
+2. Databricks SDK uploads binary files to a Unity Catalog Volume (direct object storage write).
+3. `CREATE TABLE AS SELECT` atomically materializes as a Delta table — no row-by-row overhead.
 
 ### Fail-Fast with Validation Gates
-Data quality checks run **after** Silver transformations but **before** Iceberg write. A failing check aborts the pipeline before bad data reaches storage.
+Data quality checks run **after** Silver transformations but **before** Iceberg write. A failing check aborts the pipeline before bad data reaches any storage layer. Checks: null amounts, negative amounts, schema column presence, row count bounds.
 
 ### Separation of Concerns
-Each step is a separate function with a single responsibility:
-- `load_bronze_transactions()` — ingestion only
+Each pipeline step is a separate function with exactly one responsibility:
+- `load_bronze_data()` — ingestion only
 - `apply_silver_transformations()` — transformations only
 - `validate_silver_data()` — quality gates only
-- `write_silver_iceberg()` — persistence only
+- `write_silver_iceberg()` — local persistence only
+- `export_silver_parquet()` — cloud-prep export only
+- `cloud_ingest_to_databricks()` — cloud sync only
+
+### Self-Healing Path Resolution
+All file paths go through `config.py` which:
+1. Walks up the directory tree to find `pyproject.toml` (project root marker).
+2. Checks for `GDRIVE_FINPULSE_ROOT` env var — uses cloud storage if present.
+3. Falls back to local `data/` directory if cloud is unavailable.
+Result: same notebook runs identically on Windows laptop, Google Drive mount, and Databricks — no code changes.
 
 ---
 
-## 9. What Comes Next: Gold Layer Concepts
+## 9. Cloud Ingestion Engineering: Staging Volume + CTAS
 
-### dbt Model Example (planned)
+### The Problem with Standard Spark-to-SQL Pushes
+When we initially tried standard Databricks Connect `spark.createDataFrame(pandas_df).write.saveAsTable(table)`, the notebook hung for 22+ minutes without producing any log output. Root cause: the driver serializes all 6.36M rows through Python → JVM → remote SQL endpoint → deserialize → write. Each network round-trip is synchronous, and the SQL endpoint treats each batch as a separate statement.
+
+### The Solution: Staging Volume + CREATE TABLE AS SELECT
+
+**Step 1 — Create Unity Catalog Volume (one-time setup)**
 ```sql
--- models/gold/fraud_daily_summary.sql
-WITH daily_stats AS (
-    SELECT
-        DATE(silver_processed_at) AS processing_date,
-        type,
-        COUNT(*) AS total_transactions,
-        SUM(isFraud) AS fraud_count,
-        ROUND(AVG(amount), 2) AS avg_amount,
-        SUM(CASE WHEN is_balance_discrepancy THEN 1 ELSE 0 END) AS discrepancy_count
-    FROM {{ ref('silver_transactions') }}
-    GROUP BY 1, 2
-)
-SELECT
-    *,
-    ROUND(fraud_count * 100.0 / total_transactions, 2) AS fraud_rate_pct
-FROM daily_stats
+CREATE VOLUME IF NOT EXISTS workspace.finpulse.staging;
 ```
 
-### Window Functions for Fraud Velocity (planned)
+**Step 2 — Upload Parquet files via Databricks SDK**
+```python
+from databricks.sdk import WorkspaceClient
+
+w = WorkspaceClient()  # uses DATABRICKS_HOST + DATABRICKS_TOKEN from env
+
+for f in Path("data/silver/transactions/date=2026-04-05").glob("*.parquet"):
+    remote = f"/Volumes/workspace/finpulse/staging/transactions/{f.name}"
+    with f.open("rb") as fdata:
+        w.files.upload(remote, fdata)  # direct binary transfer to object storage
+```
+This is equivalent to `aws s3 cp` — a binary file transfer with no SQL involvement.
+
+**Step 3 — Atomic CTAS (schema inferred from files)**
+```python
+conn = config.get_databricks_connection()  # Databricks SQL connector
+cursor = conn.cursor()
+
+# Drop old (if schema mismatch) and recreate atomically
+cursor.execute("DROP TABLE IF EXISTS workspace.finpulse.transactions_silver")
+cursor.execute("""
+    CREATE TABLE workspace.finpulse.transactions_silver
+    AS SELECT * FROM parquet.`/Volumes/workspace/finpulse/staging/transactions/*.parquet`
+""")
+```
+Databricks reads directly from the Volume into a new Delta table. Schema is perfectly inferred from the Parquet metadata — no manual column definition needed.
+
+### Why CTAS beats COPY INTO for initial full load
+| | COPY INTO | CTAS |
+|---|---|---|
+| Schema definition | Required (pre-created table) | Automatic (inferred from files) |
+| Incremental support | Yes (tracks ingested files) | No (full refresh only) |
+| Initial load | Good | **Better** (no pre-schema needed) |
+| Speed | High | **Highest** (parallel reads, no overhead) |
+
+For our use case (full Silver refresh from local files), CTAS is the right choice.
+
+### Performance Result
+| Method | Rows | Time | Status |
+|---|---|---|---|
+| `spark.createDataFrame().saveAsTable()` | 6,362,604 | 22+ min | Hangs/timeouts |
+| SQL INSERT batches (50K/batch) | 6,362,604 | Never finished | OOM / timeout |
+| **Staging Volume + CTAS** | **6,362,604** | **~5 minutes** | ✅ **Success** |
+
+---
+
+## 10. Gold Layer: dbt on Databricks SQL Warehouse
+
+### Project Structure
+```
+dbt_finpulse/
+├── models/
+│   ├── sources.yml              ← External Silver table registration
+│   └── gold/
+│       ├── balance_discrepancy_summary.sql
+│       ├── daily_stock_summary.sql
+│       ├── daily_transaction_summary.sql
+│       ├── fraud_rate_by_type.sql
+│       ├── high_risk_accounts.sql
+│       ├── hourly_pattern_analysis.sql
+│       ├── moving_averages.sql
+│       ├── stocks_performance_ranking.sql
+│       └── volatility_metrics.sql
+└── dbt_project.yml              ← gold: +materialized: table
+```
+
+### sources.yml — The Critical Missing Piece
+All Gold models reference Silver data via `{{ source() }}` not `{{ ref() }}`:
+```yaml
+version: 2
+sources:
+  - name: finpulse
+    database: workspace
+    schema: finpulse
+    tables:
+      - name: transactions_silver
+      - name: stocks_silver
+```
+In model SQL: `FROM {{ source('finpulse', 'transactions_silver') }}`
+
+**Why this matters for interviews:** `ref()` creates a dependency on a dbt-managed model in this project's DAG. `source()` declares an external dependency. Using `ref()` for external tables causes compilation failure and breaks the lineage graph.
+
+### Key Gold Models
+
+**1. `volatility_metrics` — Window Function for Rolling Std. Dev.**
 ```sql
--- Rolling 7-day fraud count per account
+SELECT
+    ticker,
+    date,
+    close,
+    STDDEV(close) OVER (
+        PARTITION BY ticker
+        ORDER BY date
+        ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+    ) AS volatility_7d,
+    STDDEV(close) OVER (
+        PARTITION BY ticker
+        ORDER BY date
+        ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+    ) AS volatility_30d
+FROM {{ source('finpulse', 'stocks_silver') }}
+```
+
+**2. `high_risk_accounts` — BOOLEAN cast required for Databricks**
+```sql
 SELECT
     nameOrig,
-    silver_processed_at,
-    isFraud,
-    SUM(isFraud) OVER (
-        PARTITION BY nameOrig
-        ORDER BY step
-        ROWS BETWEEN 167 PRECEDING AND CURRENT ROW  -- 7 days = 7*24 steps
-    ) AS rolling_7day_fraud_count
-FROM silver_transactions
+    COUNT(*) AS total_transactions,
+    SUM(CAST(is_balance_discrepancy AS INT)) AS discrepancy_count,  -- MUST cast
+    SUM(amount) AS total_amount_transacted
+FROM {{ source('finpulse', 'transactions_silver') }}
+WHERE is_balance_discrepancy = true
+GROUP BY 1
+HAVING COUNT(*) > 1
 ```
 
-### Soda Core Data Quality Checks (planned)
-```yaml
-checks for silver_transactions:
-  - row_count > 6000000
-  - missing_count(amount) = 0
-  - duplicate_count(nameOrig, step, amount, type) = 0
-  - values in (isFraud) must in [0, 1]
-  - avg(amount) between 100 and 500000
+**3. `fraud_rate_by_type` — Business KPI**
+```sql
+SELECT
+    type,
+    COUNT(*) AS total_transactions,
+    SUM(isFraud) AS fraud_count,
+    ROUND(SUM(isFraud) * 100.0 / COUNT(*), 4) AS fraud_rate_pct
+FROM {{ source('finpulse', 'transactions_silver') }}
+GROUP BY 1
+```
+
+### dbt Run Result (Verified)
+```
+23:08:39  Finished running 9 table models in 0 hours 0 minutes and 53.40 seconds.
+23:08:39  Completed successfully
+23:08:39  Done. PASS=9 WARN=0 ERROR=0 SKIP=0 TOTAL=9
 ```
 
 ---
 
-## 10. Interview Q&A — Mid-Senior Engineer Level
+## 11. Interview Q&A — Mid-Senior Engineer Level
 
-**Q: In our pipeline, why do we call `.count()` multiple times and what's the cost?**
-> Each `.count()` is an Action that triggers a full DAG execution from source. With 6.3M rows and 8 count calls, we effectively scan the dataset 8 times. In dev this is fine for visibility. In production, we'd materialise the DataFrame with `cache()` or `persist(StorageLevel.MEMORY_AND_DISK)` before the first count, then `unpersist()` after all counts are done.
+**Q: Why does `.count()` called multiple times in the pipeline hurt performance?**
+> Each `.count()` is an Action that re-triggers the full DAG from source — reading 6.3M rows from disk each time. With 8 count calls, we scan the dataset 8× in dev mode. In production, cache before the first count: `df.persist(StorageLevel.MEMORY_AND_DISK)`, run all counts, then `df.unpersist()`. Caching converts disk reads to memory reads for all subsequent actions.
 
-**Q: Why did we choose `dropDuplicates(["nameOrig", "step", "amount", "type"])` instead of all columns?**
-> Using all columns would miss duplicates where only a metadata column differs (like `ingestion_timestamp` which could vary slightly). Our 4-column business key defines a unique transaction event: same sender + same time step + same amount + same type = same transaction. This is domain knowledge encoded as an engineering decision.
+**Q: Why did you use `dropDuplicates([4 columns])` instead of all columns or just `nameOrig`?**
+> All columns: misses duplicates where metadata columns (like `ingestion_timestamp`) differ — same real transaction, different metadata. Just `nameOrig`: one account makes many transactions, so nameOrig alone isn't unique. The 4-column business key (sender + step + amount + type) represents the same real-world event, regardless of when or how many times it was ingested. This is domain logic turned into engineering logic.
 
 **Q: What's the risk of `inferSchema=True` in production?**
-> Schema inference reads the full file once before loading data — doubles the read cost. More critically, it guesses types based on sampled values. If the first 100 rows of a column look like integers but row 101 is "N/A", inference makes the column `integer` and the csv reader fails or silently casts. In production, always define `StructType` explicitly.
+> Doubles read cost (file scanned twice — once for schema, once for data). Worse: guesses types from the first N rows. If row N+1 has `"N/A"` in an integer column, inference produced the wrong type at startup and the row silently null-casts or hard-fails. Always define `StructType` explicitly in production. Cost: upfront schema definition. Benefit: deterministic types regardless of data content.
 
-**Q: How does `F.round()` fix the floating-point balance discrepancy check?**
-> IEEE 754 floating-point numbers can't represent all decimal fractions exactly. `1000000.0 - 999000.5` might equal `999.4999999999954` at machine level, not `999.5`. Without rounding, `oldbalance - amount != newbalance` would return `True` for perfectly valid transactions. `F.round(..., 2)` normalises to 2 decimal places (cents), eliminating false positives from floating-point artifacts.
+**Q: How does `F.round()` eliminate false positives in balance discrepancy detection?**
+> IEEE 754 can't represent all decimal fractions exactly. `1000000.0 - 999000.5` computes to `999.4999999999954` at machine precision — not `999.5`. Without rounding, `oldbalance - amount ≠ newbalance` is True for valid transactions. `F.round(..., 2)` normalizes both sides to cent precision before comparison — same principle banks use by working in integer cents internally.
 
-**Q: Why is `local[*]` with specific partition counts (8 for Transactions, 4 for Stocks) better than defaults?**
-> `local[*]` uses all available CPU cores. Transactions (6.3M rows) uses 8 partitions to maximize parallelism across cores. However, for Stocks (only 2,505 rows), having too many partitions creates more management overhead than actual benefit. We use 4 partitions for Stocks as a balanced choice for small datasets — ensuring some parallelism while avoiding the "tiny files" overhead. It's about right-sizing the compute to the data volume.
+**Q: Why did you use `source()` instead of `ref()` in your dbt Gold models?**
+> `ref()` is for models this dbt project manages — it creates a compile-time dependency in the DAG and tells dbt to build that model. `source()` is for externally-managed tables — dbt knows about them for lineage documentation but doesn't build or own them. Our Silver tables are pushed via Python SDK — they're external. Using `ref()` for them causes a compilation error: dbt looks for a .sql model file that doesn't exist.
 
-**Q: What would you change if this pipeline ran on a 20-node EMR/Databricks cluster?**
-> Remove all the Windows/local fixes. Set `spark.sql.shuffle.partitions = 400` (20 nodes × 20 cores). Use `local[*]` or a proper YARN/Kubernetes master. Replace the Hadoop catalog with a Hive Metastore or AWS Glue catalog. Use `s3a://` paths instead of local C:\ paths. Add broadcast joins for small dimension tables. Enable adaptive query execution (`spark.sql.adaptive.enabled=true`).
+**Q: What was the root cause of the 22-minute ingestion hang and how did you fix it?**
+> Standard `spark.createDataFrame(pandas_df).write.saveAsTable()` over a remote SQL Warehouse serializes all rows through: Python driver → Py4J → JVM → JDBC → SQL endpoint → Delta write. For 6.36M rows, the combined serialization + synchronous round-trip overhead is hundreds of minutes. The fix: uploading binary Parquet files directly to a Unity Catalog Volume (bypassing SQL entirely), then running a CTAS that Databricks executes server-side in parallel. Reduced from hanging to ~5 minutes.
+
+**Q: What's the difference between COPY INTO and CTAS for bulk loading?**
+> `COPY INTO` is incremental — it tracks which files have been ingested in a metadata table and skips already-loaded files. Requires the target table to exist first (schema pre-defined). Best for ongoing incremental loads. `CTAS` (CREATE TABLE AS SELECT) is atomic full-load — drops and recreates. Infers schema automatically from files. Best for initial loads and full-refresh patterns. We used CTAS because our Silver sync is always a full refresh and we needed automatic schema inference from the Parquet files.
+
+**Q: What would you change if this pipeline ran on a 20-node Databricks cluster?**
+> Remove all Windows/local workarounds. Set `spark.sql.shuffle.partitions = 400` (20 nodes × 20 cores). Enable `spark.sql.adaptive.enabled=true` for auto-partition optimization. Replace Hadoop catalog with Unity Catalog (external metastore). Use `dbfs://` or `abfss://` paths instead of local C:\. Add broadcast joins for small dimension lookups. Replace CTAS with `COPY INTO` for incremental Silver merges using Delta Lake MERGE statements.
+
+---
+
+## 12. Data Quality & Observability (Soda)
+
+### 12.1 The "Why": Trust at Scale
+With 6.36 million records moving from local storage to the cloud, manual row-counting is insufficient. We implemented **Soda Core** (Python CLI) to automate the verification of the Silver layer before analytics consumption.
+
+### 12.2 Isolated Execution via `uvx`
+Soda Core 3.x has strict legacy dependencies (e.g., `pandas < 2.0.0`) that conflict with the modern `pandas 2.x` stack used for our feature engineering.
+- **Solution:** Instead of compromising the project dependencies, we use `uvx` (ephemeral tool environments).
+- **Benefit:** Soda runs in its own isolated container with older `setuptools` to handle the `distutils` removal in Python 3.12, while the main pipeline remains on the cutting edge.
+
+```powershell
+uvx --from soda-core --with soda-core-spark --with databricks-sql-connector --with setuptools soda scan ...
+```
+
+### 12.3 Key Checks Implemented
+We defined 21 distinct checks across Transactions and Stocks:
+- **Volumetrics:** `row_count between 6M and 7M` (Catches silent ingestion loss).
+- **Statistical Sanity:** `avg(amount)` and `max(daily_return)` bounds (Catches calculation overflows).
+- **Schema Integrity:** `missing_count(risk_flag) = 0` (Ensures ML pipelines don't receive nulls).
+- **Business Logic:** `invalid_count(type) = 0` with valid enum values (Ensures simulation integrity).
+
+### 12.4 Custom SQL Metrics
+For specialized checks like "Ensuring all 5 tickers are present," we use **Custom SQL Metric** blocks within the YAML.
+```yaml
+- ticker_count = 5:
+    name: all_tickers_present
+    ticker_count query: |
+      SELECT COUNT(DISTINCT ticker) FROM stocks_silver
+```
+This demonstrates the ability to extend the DQ framework beyond simple threshold checks into complex domain-specific validation.
+
+---

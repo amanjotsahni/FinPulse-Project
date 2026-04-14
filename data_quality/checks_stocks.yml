@@ -1,0 +1,68 @@
+# data_quality/checks_stocks.yml
+# Runs against: finpulse.stocks_silver on Databricks
+
+checks for stocks_silver:
+
+  # Check 1 — Exact row count
+  # Why: Stocks data is deterministic — always 501 days × 5 tickers
+  # Any deviation means data loss or duplication
+  - row_count = 2505:
+      name: exact_stock_record_count
+
+  # Check 2 — No null close prices
+  # Why: close is used in daily_return, moving averages, performance ranking
+  # One null cascades into multiple broken Gold models
+  - missing_count(close) = 0:
+      name: no_null_close_prices
+
+  # Check 3 — No negative or zero close prices
+  # Why: Stock price cannot be zero or negative — indicates data corruption
+  - min(close) > 0:
+      name: no_invalid_close_prices
+
+  # Check 4 — All 5 tickers present
+  # Why: If Yahoo Finance failed to fetch one ticker —
+  # performance_ranking and volatility_metrics will be incomplete
+  - ticker_count = 5:
+      name: all_tickers_present
+      ticker_count query: |
+        SELECT COUNT(DISTINCT ticker) FROM stocks_silver
+
+  # Check 5 — No duplicate ticker + date combinations
+  # Why: One stock can only have one price per day
+  # Duplicates would inflate moving averages and volume metrics
+  - duplicate_count(ticker, date) = 0:
+      name: no_duplicate_ticker_dates
+
+  # Check 6 — No null dates
+  # Why: Window functions order by date — null dates break time series
+  - missing_count(date) = 0:
+      name: no_null_dates
+
+  # Check 7 — High price always >= Low price
+  # Why: Mathematical impossibility otherwise — data corruption
+  # high < low means OHLCV data is scrambled
+  - failed rows:
+      name: high_above_low
+      fail query: |
+        SELECT *
+        FROM stocks_silver
+        WHERE high < low
+
+  # Check 8 — Moving averages populated
+  # Why: moving_avg_7d and moving_avg_30d computed in Silver
+  # If null — window function failed silently
+  - missing_count(moving_avg_7d) = 0:
+      name: moving_avg_7d_populated
+
+  # Check 9 — Daily return within reasonable bounds
+  # Why: No stock moves more than 50% in a day normally
+  # Extreme values indicate calculation error
+  - max(daily_return) < 50:
+      name: daily_return_upper_bound
+  - min(daily_return) > -50:
+      name: daily_return_lower_bound
+
+  # Check 10 — Pipeline metadata present
+  - missing_count(silver_processed_at) = 0:
+      name: processing_timestamp_exists

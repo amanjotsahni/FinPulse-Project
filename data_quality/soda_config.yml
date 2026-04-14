@@ -1,0 +1,19 @@
+# data_quality/soda_config.yml
+
+data_source transactions_silver:
+  type: spark
+  connection:
+    method: databricks
+    host: dbc-6ee18cda-1d4e.cloud.databricks.com
+    http_path: /sql/1.0/warehouses/5e0d68e9ac57b378
+    token: ${DATABRICKS_TOKEN}
+    schema: finpulse
+
+data_source stocks_silver:
+  type: spark
+  connection:
+    method: databricks
+    host: dbc-6ee18cda-1d4e.cloud.databricks.com
+    http_path: /sql/1.0/warehouses/5e0d68e9ac57b378
+    token: ${DATABRICKS_TOKEN}
+    schema: finpulse

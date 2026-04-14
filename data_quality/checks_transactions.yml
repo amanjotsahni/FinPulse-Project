@@ -1,0 +1,59 @@
+# data_quality/checks_transactions.yml
+# Runs against: finpulse.transactions_silver on Databricks
+
+checks for transactions_silver:
+
+  # Check 1 — Row count within expected range
+  # Why: Catches silent data loss during Silver processing
+  # If 6.3M rows became 100K — something went catastrophically wrong
+  - row_count between 6000000 and 7000000
+
+  # Check 2 — No null amounts
+  # Why: Amount is the most critical field — null amount means
+  # downstream aggregations silently drop records
+  - missing_count(amount) = 0:
+      name: no_null_amounts
+      fail: when > 0
+
+  # Check 3 — No zero or negative amounts
+  # Why: We removed these in Silver — if any remain, transformation failed
+  - min(amount) > 0:
+      name: no_zero_amounts
+
+  # Check 4 — isFraud only contains 0 or 1
+  # Why: Any other value means data corruption — ML models will break
+  - invalid_count(isFraud) = 0:
+      name: fraud_flag_valid
+      valid values: [0, 1]
+
+  # Check 5 — Fraud rate within expected range
+  # Why: PaySim has 0.13% fraud — if rate jumps to 50% something is wrong
+  # Calculated as: fraud_count / total_count * 100
+  - max(isFraud) <= 1:
+      name: fraud_rate_sanity
+
+  # Check 6 — Transaction types only valid values
+  # Why: type_encoded logic depends on exactly these 5 types existing
+  - invalid_count(type) = 0:
+      name: valid_transaction_types
+      valid values: [TRANSFER, CASH_OUT, PAYMENT, DEBIT, CASH_IN]
+
+  # Check 7 — No negative balance values
+  # Why: oldbalanceOrg can be 0 but never negative in real banking
+  - min(oldbalanceOrg) >= 0:
+      name: no_negative_origin_balance
+
+  # Check 8 — Balance discrepancy flag populated
+  # Why: is_balance_discrepancy must exist — AI agent reads it
+  - missing_count(is_balance_discrepancy) = 0:
+      name: discrepancy_flag_exists
+
+  # Check 9 — Risk flag populated  
+  # Why: risk_flag feeds directly into anomaly detection agent
+  - missing_count(risk_flag) = 0:
+      name: risk_flag_exists
+
+  # Check 10 — Pipeline metadata present
+  # Why: Every row must know when it was processed — audit trail
+  - missing_count(silver_processed_at) = 0:
+      name: processing_timestamp_exists

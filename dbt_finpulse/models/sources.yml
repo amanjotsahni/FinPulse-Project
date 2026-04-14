@@ -1,0 +1,12 @@
+version: 2
+
+sources:
+  - name: finpulse
+    description: "Silver layer tables pushed from local processing"
+    database: workspace
+    schema: finpulse
+    tables:
+      - name: transactions_silver
+        description: "Standardized financial transactions data (Paysim)"
+      - name: stocks_silver
+        description: "Standardized stock market historical data (Yahoo Finance)"

@@ -81,6 +81,27 @@ FRAUD_CONTAMINATION_RATE = 0.013
 HIGH_CONFIDENCE_THRESHOLD = 0.85
 MEDIUM_CONFIDENCE_THRESHOLD = 0.60
 
+# ── Databricks SQL Config ────────────────────────────────────
+DATABRICKS_HOST = os.getenv("DATABRICKS_HOST")
+DATABRICKS_HTTP_PATH = os.getenv("DATABRICKS_HTTP_PATH")
+DATABRICKS_TOKEN = os.getenv("DATABRICKS_TOKEN")
+DATABRICKS_CATALOG = os.getenv("DATABRICKS_CATALOG", "hive_metastore")
+DATABRICKS_SCHEMA = os.getenv("DATABRICKS_SCHEMA", "finpulse")
+
+
+def get_databricks_connection():
+    """Returns a connection to the Databricks SQL Warehouse."""
+    from databricks import sql
+    if not all([DATABRICKS_HOST, DATABRICKS_HTTP_PATH, DATABRICKS_TOKEN]):
+        raise ValueError("Databricks credentials missing from .env")
+    
+    return sql.connect(
+        server_hostname=DATABRICKS_HOST,
+        http_path=DATABRICKS_HTTP_PATH,
+        access_token=DATABRICKS_TOKEN
+    )
+
+
 # ── Pipeline Config ──────────────────────────────────────────
 PIPELINE_VERSION = "v1.0"
 DATA_SOURCE_TRANSACTIONS = "kaggle_paysim"
