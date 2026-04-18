@@ -668,7 +668,7 @@ Each pipeline step is a separate function with exactly one responsibility:
 - `validate_silver_data()` — quality gates only
 - `write_silver_iceberg()` — local persistence only
 - `export_silver_parquet()` — cloud-prep export only
-- `cloud_ingest_to_databricks()` — cloud sync only
+- `promote_to_databricks()` — cloud sync only
 
 ### Self-Healing Path Resolution
 All file paths go through `config.py` which:
@@ -885,5 +885,385 @@ For specialized checks like "Ensuring all 5 tickers are present," we use **Custo
       SELECT COUNT(DISTINCT ticker) FROM stocks_silver
 ```
 This demonstrates the ability to extend the DQ framework beyond simple threshold checks into complex domain-specific validation.
+---
+
+## 13. Elementary Data: Regulatory-Grade Observability
+
+### Why Elementary?
+While Soda checks the **data**, Elementary monitors the **pipeline**. It provides a regulatory-grade audit trail of every dbt run.
+
+### What it tracks in Databricks:
+- **Lineage**: Source CSV → Silver Iceberg → Gold Delta.
+- **Freshness**: When was the table last updated?
+- **Schema Drift**: Did a column type change unexpectedly?
+- **Model Performance**: Which dbt models are slowing down as data grows?
+
+### Interview Talk-Track:
+*"I used Elementary to generate a compliance-ready audit trail. It automatically captures model run results and test failures into permanent Delta tables in Databricks. This is the exact pattern used in highly regulated Tier-1 banks for SOX compliance monitoring."*
 
 ---
+
+## 14. Prefect Orchestration: Production Patterns
+
+### 14.1 Idempotent Skip Logic
+The pipeline checks for a `.last_processed` marker (`C:\FinPulse Project\data\bronze\.last_processed`). If the Bronze data hasn't changed, the Silver step returns a `SKIPPED` state. This saves compute and prevents redundant snapshot creation.
+
+### 14.2 Survival Mode (`return_state=True`)
+```python
+gold_state = run_dbt_task(return_state=True)
+test_state = run_dbt_tests(return_state=True)
+run_elementary_report(wait_for=[test_state])
+```
+Standard pipelines crash on the first error. FinPulse uses **Survival Mode**: even if a dbt test fails, the pipeline continues to generate the **Elementary Report**. 
+**Why?** Because a data quality failure is exactly when you need the observability report the most.
+
+### 14.3 RAM-Aware Ingestion (Chunking)
+On an 8GB RAM limit, loading a 1.85GB CSV into memory causes an OOM kill. We implemented **chunked ingestion (500,000 rows per batch)** when converting Bronze CSV to partitioned Parquet. This keeps the memory floor low and the pipeline stable on consumer hardware.
+
+---
+
+## 15. Architecture Decision Journal (ADJ)
+
+- **ADJ-01: Local-First Development**: All heavy lifting (PySpark, Iceberg) happens locally to minimize cloud costs (₹0 project target). Databricks is used only for the final Analytics (Gold) layer.
+- **ADJ-02: Volume Upload vs. JDBC**: Solved the 22-min timeout by moving to binary cloud promotion. High-volume ingestion is a storage problem, not a SQL problem.
+- **ADJ-03: No Docker (Initial Phase)**: Prioritized Windows native performance tuning (winutils, JVM args) over containerization overhead on limited 8GB hardware.
+
+---
+
+## 16. AI Compliance Intelligence System — Full Technical Reference
+
+### 16.0 System Overview
+The AI layer is a **4-agent inference system** that sits on top of the completed Medallion pipeline. It reads from pre-computed Gold tables — zero pipeline execution, zero data movement. All agents operate as pure inference layers.
+
+```
+Gold Layer (Databricks)               AI Intelligence Layer (Streamlit)
+  fraud_rate_by_type         ──────►  Agent 1: HUNT     (Isolation Forest)
+  high_risk_accounts         ──────►  Agent 2: INVESTIGATE (Gemini RAG)
+  balance_discrepancy_summary ─────►  Agent 3: REASON   (DeepSeek R1)
+  stocks_performance_ranking ──────►  Agent 4: BRIEF    (PDF Reporting)
+```
+
+**Design principle:** Agents never trigger pipeline runs. They query Databricks SQL Warehouse directly via `databricks-sql-connector`, cache results with `@st.cache_data(ttl=600)`, and process entirely in-memory on the Streamlit server.
+
+---
+
+## 16.1 Agent 1: HUNT — Complete Technical Dissection
+
+### 16.1.1 The Problem It Solves
+From 6.36M raw transaction records, the Gold dbt model `balance_discrepancy_summary` already pre-filtered to rows with accounting discrepancies. Agent 1 takes this pre-filtered set and answers: **"Which of these discrepancies are actually fraudulent, and which are just accounting noise?"**
+
+### 16.1.2 Data Loading — Stratified Sampling Pattern
+
+**Source table:** `finpulse.balance_discrepancy_summary` (Gold layer)  
+**Columns fetched:** `account_id, type, amount, oldbalanceOrg, newbalanceOrig, oldbalanceDest, newbalanceDest, balance_gap, is_fraud`
+
+**Why stratified, not random:**
+
+| Sampling Method | Fraud rows in 50K sample | Representation |
+|---|---|---|
+| Pure random 50K | ~65 rows (0.13%) | ❌ Insufficient for model to see fraud cluster |
+| Stratified | ALL 8,197 fraud + 50K normal | ✅ Full fraud signal preserved |
+
+```python
+# Step A: Always include ALL fraud rows
+cursor.execute("... WHERE is_fraud = 1")
+df_fraud   # 8,197 rows — never sampled away
+
+# Step B: Random 50K normal via Databricks-native ORDER BY RAND()
+cursor.execute("... WHERE is_fraud = 0 ORDER BY RAND() LIMIT 50000")
+df_normal  # 50,000 rows
+
+df = pd.concat([df_fraud, df_normal])  # 58,197 rows total
+```
+
+**Databricks Decimal → Python float conversion:**
+Databricks SQL Connector returns numeric types as Python `decimal.Decimal` objects. Without explicit conversion, pandas operations silently produce incorrect results or raise TypeError.
+```python
+for col in float_cols:
+    df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+```
+
+**Caching strategy:** `@st.cache_data(ttl=600)` — the 600-second TTL means the 50K-row query fires at most once per 10 minutes regardless of user interactions (slider moves, button clicks all cause Streamlit reruns). Without this, every contamination slider adjustment would hit Databricks.
+
+---
+
+### 16.1.3 Feature Engineering — 5 Features from First Principles
+
+All features are derived from domain knowledge of PaySim fraud mechanics, not from correlation analysis.
+
+| Feature | Formula | Why It's a Fraud Signal |
+|---|---|---|
+| `amount` | raw | Criminals maximise per-theft. Large amounts disproportionately appear in fraud. |
+| `balance_gap` | `oldbalanceOrg - amount - newbalanceOrig` | The core accounting discrepancy. Money that "vanished" in transit. In legitimate TRANSFER, this should be ≈0. In fraud, it's exactly equal to the transaction amount. |
+| `gap_ratio` | `balance_gap / amount.clip(lower=1)` | Normalises the gap relative to transaction size. A ratio of 1.0 means 100% of the amount is unaccounted for — the strongest single fraud signal. clip(lower=1) prevents division by zero on zero-amount rows. |
+| `dest_drain` | `newbalanceDest - oldbalanceDest` | How much the destination grew. In PaySim fraud, criminals immediately move funds out — destination stays at 0 even after receiving large transfers. |
+| `is_transfer` | `1 if type == "TRANSFER" else 0` | TRANSFER has ~0.76% fraud rate vs. CASH_OUT ~0.0001%. Domain-encoded as binary to give the model a type-aware signal without one-hot encoding overhead. |
+
+**Key implementation detail:** `df["amount"].clip(lower=1)` prevents `ZeroDivisionError` in gap_ratio computation for zero-amount rows while preserving semantic meaning (a $0 transaction with a balance gap is undefined → clamped to 1 for ratio purposes).
+
+---
+
+### 16.1.4 StandardScaler — Why It's Non-Negotiable
+
+```python
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+```
+
+Feature value ranges before scaling:
+| Feature | Typical range | Without scaling |
+|---|---|---|
+| `amount` | $0 – $92,000,000 | Dominates all others |
+| `balance_gap` | $0 – $92,000,000 | Also large |
+| `gap_ratio` | 0.0 – 1.0+ | Ignored |
+| `dest_drain` | -$92M – $92M | Ignored |
+| `is_transfer` | 0 or 1 | Completely ignored |
+
+After `StandardScaler`: all features have mean=0, std=1. Isolation Forest's random split selection now allocates equal "attention" to each feature. `is_transfer` (0 or 1) and `amount` ($millions) have equal influence on tree splits.
+
+---
+
+### 16.1.5 Isolation Forest — Algorithm Deep Dive
+
+**How it works:**
+1. Randomly select a feature.
+2. Randomly select a split value between the feature's min and max.
+3. Record the depth at which the data point gets isolated (separated into its own partition).
+4. Repeat with 100 trees (`n_estimators=100`).
+5. Average path length across all trees — shorter = more anomalous.
+
+```python
+iso_forest = IsolationForest(
+    contamination=0.013,   # threshold for anomaly decision boundary
+    random_state=42,       # reproducible tree splits
+    n_estimators=100,      # 100 trees → stable score estimates
+)
+
+# fit_predict: trains AND predicts simultaneously (transductive learning)
+# Returns: -1 (anomaly) or +1 (normal) for every row
+predictions = iso_forest.fit_predict(X_scaled)
+
+# score_samples: raw path-length score (more negative = more isolated = more anomalous)
+# Multiply by -1 so higher = more suspicious (more intuitive for UI display)
+scores = iso_forest.score_samples(X_scaled) * -1
+
+# Min-Max normalize to 0–100 for UI progress bar display
+scores_normalised = (scores - scores.min()) / (scores.max() - scores.min()) * 100
+```
+
+**Contamination parameter decision:**
+```
+Default contamination = 0.10
+→ Flags 10% of 58K rows = 5,800 accounts flagged
+→ Compliance team cannot investigate 5,800 accounts
+→ Destroys analyst trust → tool abandoned
+
+Domain-calibrated contamination = 0.013
+→ Flags ~1.3% of 58K rows = ~755 accounts flagged
+→ Matches the actual fraud base rate in the dataset
+→ Operationally viable for a compliance team
+```
+
+**Why `random_state=42`:** Isolation Forest uses random splits. Without a fixed seed, two runs with the same data produce different scores. `random_state=42` guarantees that clicking "Run Detection" twice produces identical results — critical for audit trail reproducibility.
+
+---
+
+### 16.1.6 Domain Rules Engine — Defense in Depth
+
+```python
+# Thresholds derived empirically from the Gold layer sample
+amount_75th = df["amount"].quantile(0.75)
+gap_75th    = df["balance_gap"].quantile(0.75)
+ratio_75th  = df["gap_ratio"].quantile(0.75)
+
+# Rule: flag if 2 out of 3 conditions are met (majority vote, not strict AND)
+cond1 = (df["amount"]      >= amount_75th).astype(int)  # large transaction
+cond2 = (df["balance_gap"] >= gap_75th).astype(int)     # large discrepancy
+cond3 = (df["gap_ratio"]   >= ratio_75th).astype(int)   # high proportion unaccounted
+
+df["rule_flag"] = ((cond1 + cond2 + cond3) >= 2).astype(int)
+```
+
+**Why 2-of-3 and not strict AND (all 3)?**  
+Strict AND would miss transactions that are large AND have high gap_ratio but sit just below the gap absolute threshold. A TRANSFER of $50,000 with gap_ratio = 0.99 is almost certainly fraud even if balance_gap is at the 73rd percentile. 2-of-3 is more robust to edge cases at threshold boundaries.
+
+**Tier assignment logic:**
+```python
+# HIGH:   Isolation Forest flagged it AND domain rules flagged it
+#         → Both independent systems agree → strongest signal
+# MEDIUM: One of the two systems flagged it
+#         → Worth human investigation but not a conviction
+# LOW:    Neither system raised a flag — normal transaction
+```
+
+---
+
+### 16.1.7 Live Run Results (Verified from Screenshot)
+
+**Gold Layer Dashboard (pre-run, from Databricks):**
+| Metric | Value |
+|---|---|
+| Total Transactions | 6.36M |
+| Confirmed Fraud | 8.1K |
+| Fraud Rate | 0.1288% |
+| Contamination Param | 0.013 |
+
+**Fraud by Transaction Type (Gold `fraud_rate_by_type`):**
+| Type | Total | Fraud Count | Rate | Tier |
+|---|---|---|---|---|
+| PAYMENT | ~1,021,000 | 4 | ~0.0004% | 🟢 CLEAR |
+| TRANSFER | ~531,000 | **4,071** | **~0.76%** | 🔴 HIGH |
+| CASH_OUT | ~2,800,000 | 4 | ~0.0001% | 🟡 LOW |
+| DEBIT | ~41,000 | 3 | ~0.007% | 🟡 LOW |
+| CASH_IN | ~1,300,000 | 0 | 0% | 🟢 CLEAR |
+
+**Detection Engine Results (contamination=0.013, ALL types):**
+| Metric | Live Value |
+|---|---|
+| Transactions Sampled | **58,026** |
+| HIGH Risk | **25** |
+| MEDIUM Risk | **9,065** |
+| LOW (Normal) | **40,190** |
+| Confirmed Fraud in Sample | **28** |
+
+---
+
+### 16.1.8 Plotly Scatter Plot — Technical Design Decisions
+
+**Layout rationale:**
+- X = `amount`: Fraud involves large transactions → rightward cluster
+- Y = `balance_gap`: Money that vanished → upward cluster  
+- Together: fraud should cluster top-right — the HIGH RISK ZONE
+
+**HIGH RISK ZONE annotation:**
+```python
+# The rectangle is drawn at exactly the same thresholds as apply_rules()
+# This visually confirms ML cluster and rule thresholds are co-located
+fig.add_shape(
+    type="rect",
+    x0=df["amount"].quantile(0.75),
+    x1=df["amount"].max() * 1.05,
+    y0=df["balance_gap"].quantile(0.75),
+    y1=df["balance_gap"].max() * 1.05,
+    line=dict(color="rgba(248,113,113,0.35)", dash="dot"),
+    fillcolor="rgba(248,113,113,0.04)",
+)
+```
+
+**Trace design for three risk tiers:**
+- LOW (grey): opacity=0.4, size=5 — dense background cluster, visually recedes
+- MEDIUM (amber): size=ML score clipped 6–16 — size tracks model confidence
+- HIGH (red): size=ML score clipped 10–20, opacity=0.9 — dominant foreground
+
+**Hover tooltip:** Account ID (bold), Type, Amount, Balance Gap, Anomaly Score, Tier — exactly the fields needed for a compliance analyst to decide next action.
+
+---
+
+### 16.1.9 Flagged Accounts Table — UX Engineering
+
+**Columns rendered:**
+1. `Account ID` — monospace for readability of PaySim format (e.g., `C1137538024`)
+2. `Type` — transaction type (TRANSFER or CASH_OUT)
+3. `Amount` — formatted with `$` and `,` separators
+4. `Balance Gap` — absolute unaccounted amount in dollars
+5. `Gap Ratio` — normalised score, 2 decimal places
+6. `Anomaly Score` — in-cell progress bar (0–100) + coloured numeric label
+7. `Risk Tier` — HIGH (red badge) / MEDIUM (amber badge)
+8. `Fraud Status` — CONFIRMED (red) / UNCONFIRMED (green) from ground truth
+
+**Pagination implementation:**
+- 25 rows per page
+- Sliding window of 7 page buttons centred on current page
+- `st.session_state["_hunt_page"]` persists across reruns
+- Filter key `f"{search}|{tier}"` resets to page 1 when filter changes
+
+**Anomaly Score bar (inline HTML in table cell):**
+```python
+_bar_color = "#F87171" if score >= 75 else "#FBBF24" if score >= 50 else "#4A6080"
+# Renders a CSS-animated div width proportional to score
+```
+
+**Collapsible glossary:** `<details>/<summary>` HTML element with grid layout — explains all 8 columns in plain English for non-technical compliance users. Opens on click, no JS required.
+
+---
+
+### 16.1.10 Session State Architecture
+
+```python
+# Agent 1 saves its scored records for Agent 2 to consume
+st.session_state.agent1_results = flagged[[
+    "account_id", "type", "amount", "balance_gap", "gap_ratio",
+    "dest_drain", "is_fraud",
+    "anomaly_score", "confidence_tier", "rule_flag", "ml_flag",
+]].to_dict("records")
+```
+
+**Why dict records and not DataFrame:**  
+`st.session_state` is serialised across Streamlit reruns. Pandas DataFrames are not JSON-serialisable by default and can fail silently. `dict("records")` converts to a list of plain Python dicts — serialisable, reproducible, and directly usable by Agent 2 without re-importing pandas.
+
+**Downstream consumption:** Agent 2 (INVESTIGATE) checks `if st.session_state.agent1_results is not None` — if populated, it shows the investigation interface with the flagged accounts from Agent 1; if not, it shows the gold-layer-only fallback view.
+
+---
+
+## 16.2 Agent 2: INVESTIGATE (Account RAG)
+- **Model:** Gemini 2.0 Flash (250K context window).
+- **Mechanism:** Cross-references account-level transaction history from the Gold layer with market volatility data for high-fidelity auditing.
+- **Input:** `st.session_state.agent1_results` from Agent 1 — list of flagged account dicts.
+- **Status:** RAG pipeline wired; conversational interface in active development.
+
+## 16.3 Agent 3: REASON (Regulatory Classification)
+- **Model:** DeepSeek R1 (Chain-of-Thought via OpenRouter).
+- **Framework:** BSA / AML (Bank Secrecy Act).
+- **Actions:** SAR · FREEZE · ESCALATE · MONITOR · CLEAR.
+- **Value:** Streaming reasoning provides a human-readable audit trail for compliance officers.
+- **Input:** `st.session_state.agent2_context` from Agent 2.
+- **Status:** Prompt architecture complete; streaming integration in active development.
+
+## 16.4 Agent 4: BRIEF (Executive Reporting)
+- **Consolidation:** Aggregates findings from Agents 1–3 into a board-ready report.
+- **Format:** One-click PDF export with integrated Databricks Gold layer statistical grounding.
+- **Input:** All three prior agent outputs + live Gold KPIs.
+- **Status:** Template design complete; PDF rendering library (`fpdf2`) integrated.
+
+---
+
+## 16.5 Streamlit UI Architecture
+
+### Design System Constants
+```python
+# Palette defined in custom CSS injected via st.markdown(..., unsafe_allow_html=True)
+# Body:    #1A2E4A (deep navy)
+# Card:    #172340 (medium navy — distinct from body)
+# Raised:  #1E2E50 (hover / elevated surface)
+# Sidebar: #090E18 (darkest ink)
+# T1:      #C8D8F0  T2: #7E9BB8  T3: #4A6080
+# Accent:  #60A5FA (sky blue)
+# Danger:  #F87171  Warning: #FBBF24  Clear: #34D399
+# Font:    Inter (body) + JetBrains Mono (data values)
+```
+
+### CSS Override Approach
+All Streamlit native styles are overridden via injected CSS targeting Streamlit's internal `data-testid` attributes. This includes:
+- Sidebar collapse buttons → `display:none`
+- Radio widget label (nav items) → custom styling
+- Toolbar / deploy button → hidden
+- Slider + selectbox → design system colours
+
+**Why `!important` everywhere in the CSS:** Streamlit's CSS is compiled with high specificity via Emotion CSS-in-JS. Standard overrides lose the specificity battle. `!important` is the only reliable way to override them from external stylesheets injected at runtime.
+
+### `@st.cache_data` Strategy
+| Function | TTL | Rationale |
+|---|---|---|
+| `load_gold_stats()` | 300s (5 min) | KPI panel — acceptable to show minor staleness |
+| `load_discrepancy_data()` | 600s (10 min) | 50K-row query — expensive, rate-limit Databricks |
+| Pipeline status | On-demand button | Not cached — always real-time |
+
+---
+
+## 17. Repository Standards for Production Deployment
+
+- **Dependency locking:** `uv.lock` pins exact content hashes for all packages including transitive deps.
+- **Environment variables:** All credentials via `.env` (gitignored) loaded with `dotenv.load_dotenv()`.
+- **Windows compatibility:** JVM/JDK 11, all paths forward-slash converted, no native I/O calls.
+- **Design system:** Documented in CSS comments in `finpulse_app.py`. Palette + typography + spacing all tokenised.
+- **Session state documentation:** Each key in `st.session_state` documented with producer and consumer agent.

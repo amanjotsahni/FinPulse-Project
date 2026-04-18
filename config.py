@@ -73,7 +73,7 @@ SPARK_MASTER = os.getenv("SPARK_MASTER", "local[*]")
 
 # ── Model Config ─────────────────────────────────────────────
 GROQ_MODEL = "llama3-70b-8192"
-GEMINI_MODEL = "gemini/gemini-2.5-flash"
+GEMINI_MODEL = "gemini/gemini-2.0-flash"
 DEEPSEEK_MODEL = "openrouter/deepseek/deepseek-r1"
 
 # ── Anomaly Detection ────────────────────────────────────────

@@ -11,6 +11,9 @@ exclude.txt
 dbt_finpulse/target/
 dbt_finpulse/logs/
 dbt_finpulse/dbt_packages/
+dbt_finpulse/edr_target/
+package-lock.yml
+dbt_finpulse/package-lock.yml
 
 # IDE & Agent Metadata (Noise reduction)
 .gemini/
@@ -75,3 +78,10 @@ data/
 # Debug artifacts (Keep local, ignore in Git)
 scratch/
 syspath.txt
+edr_target/
+*.log
+*.json
+*.html
+refresh_dashboard.ps1
+CLAUDE.md
+.tmp.*/

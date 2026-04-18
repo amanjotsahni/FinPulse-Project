@@ -1,0 +1,28 @@
+version: 2
+
+models:
+  - name: stocks_performance_ranking
+    description: "Ranking of stocks by performance metrics"
+    columns:
+      - name: ticker
+        tests:
+          - not_null
+      - name: performance_rank
+        tests:
+          - not_null
+
+  - name: daily_transaction_summary
+    description: "Daily summary of transactions"
+    columns:
+      - name: transaction_date
+        tests:
+          - not_null
+      - name: total_amount
+        tests:
+          - not_null
+
+  - name: balance_discrepancy_summary
+    columns:
+      - name: amount
+        tests:
+          - not_null
