@@ -1,0 +1,824 @@
+"""
+FinPulse — Agent 4: EXECUTIVE NARRATIVE ENGINE
+===============================================
+The final agent in the pipeline. Takes all prior agent outputs and
+produces board-ready, regulator-ready, plain-English narratives.
+
+Fundamental difference from Agents 1, 2, 3:
+
+  Agent 1  →  DETECTION:    Isolation Forest scores, ML flags, rule triggers
+  Agent 2  →  INVESTIGATION: Per-account chat, transaction evidence
+  Agent 3  →  ASSESSMENT:   Systemic risk classification, regulatory decision
+  Agent 4  →  NARRATIVE:    Plain English story for non-technical decision makers
+
+Audience: Chief Compliance Officer, Board Risk Committee, Regulators, Press Office
+NOT for: Data scientists, analysts, compliance investigators (that was Agents 1-3)
+
+Key differentiators:
+  - Three distinct narrative modes: BOARD / REGULATOR / PRESS
+  - No jargon — translates all technical findings into business language
+  - Action items with owners and deadlines — not just findings
+  - The IBM AML market correlation story told as a business narrative
+  - Downloadable plain-text report
+  - Visual pipeline summary showing all 4 agents contributing
+  - Industry benchmark comparisons to contextualise findings
+"""
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import os
+import sys
+import json
+from pathlib import Path
+from datetime import datetime, timedelta
+
+_PROJECT_ROOT = Path(__file__).parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GROQ CLIENT  (same provider as Agent 2 but completely different use case)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _get_groq_client():
+    if "groq_client_agent4" not in st.session_state:
+        import dotenv
+        from groq import Groq
+        dotenv.load_dotenv(r"C:\FinPulse Project\.env")
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            raise ValueError("GROQ_API_KEY not found in .env")
+        st.session_state.groq_client_agent4 = Groq(api_key=api_key)
+    return st.session_state.groq_client_agent4
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONTEXT ASSEMBLY — Distils all prior agent outputs into narrative briefing
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_narrative_briefing(
+    agent1_results: list,
+    agent2_context: dict,
+    agent3_output: dict,
+    audience: str,
+) -> str:
+    """
+    Builds a plain-English briefing document for the LLM to convert into
+    executive narrative. Deliberately strips technical jargon — by the time
+    it reaches Agent 4, the analysis is done. Now we need the story.
+    """
+    lines = []
+
+    # ── Intelligence Summary ──────────────────────────────────────────────────
+    lines.append("INTELLIGENCE SUMMARY FOR EXECUTIVE NARRATIVE")
+    lines.append("=" * 60)
+    lines.append(f"Report date: {datetime.now().strftime('%B %d, %Y')}")
+    lines.append(f"Target audience: {audience}")
+    lines.append(f"Dataset: IBM AML HI-Small — 5,078,316 financial transactions")
+    lines.append(f"Period covered: September 1-10, 2022 (10 banking days)")
+    lines.append("")
+
+    # ── Agent 1 Summary ───────────────────────────────────────────────────────
+    lines.append("WHAT THE AI DETECTION ENGINE FOUND (Agent 1)")
+    lines.append("-" * 40)
+    if agent1_results:
+        high  = [r for r in agent1_results if r.get("confidence_tier") == "HIGH"]
+        med   = [r for r in agent1_results if r.get("confidence_tier") == "MEDIUM"]
+        fraud = [r for r in agent1_results if r.get("is_fraud") == 1]
+        scores = [r.get("anomaly_score", 0) for r in agent1_results]
+        top3   = sorted(agent1_results, key=lambda r: r.get("anomaly_score", 0), reverse=True)[:3]
+
+        lines.append(f"The AI scanned {len(agent1_results):,} transactions.")
+        lines.append(f"Serious concern (HIGH tier): {len(high)} accounts")
+        lines.append(f"Worth reviewing (MEDIUM tier): {len(med)} accounts")
+        lines.append(f"Ground-truth confirmed laundering: {len(fraud)} accounts")
+        lines.append(f"AI score range: {min(scores):.0f} to {max(scores):.0f} out of 100")
+        lines.append(f"Top 3 most suspicious:")
+        for r in top3:
+            lines.append(
+                f"  - Account {r.get('account_id','?')}: score {r.get('anomaly_score',0):.0f}/100"
+                f" ({r.get('confidence_tier','?')} risk)"
+                f" at {r.get('entity_name','unknown entity')}"
+            )
+        # Typology counts
+        r1 = sum(r.get("rule1_flag", 0) for r in agent1_results)
+        r2 = sum(r.get("rule2_flag", 0) for r in agent1_results)
+        r3 = sum(r.get("rule3_flag", 0) for r in agent1_results)
+        lines.append(f"Large wire transfers (>$100K) flagged: {r1}")
+        lines.append(f"Currency-switching transactions flagged: {r2}")
+        lines.append(f"High-risk bank routing flagged: {r3}")
+    else:
+        lines.append("Agent 1 results not available.")
+    lines.append("")
+
+    # ── Agent 2 Summary ───────────────────────────────────────────────────────
+    lines.append("WHAT THE INVESTIGATOR FOUND (Agent 2)")
+    lines.append("-" * 40)
+    if agent2_context:
+        acct  = agent2_context.get("selected_account", "Unknown")
+        turns = len(agent2_context.get("full_history", []))
+        lines.append(f"Primary account investigated: {acct}")
+        lines.append(f"Investigation depth: {turns} rounds of questioning")
+        lines.append("Key findings from the investigation:")
+        for turn in agent2_context.get("full_history", [])[-4:]:
+            lines.append(f"  Question: {turn['question']}")
+            lines.append(f"  Finding: {turn['answer'][:200].strip()}...")
+            lines.append("")
+    else:
+        lines.append("No specific account investigation was conducted.")
+        lines.append("Proceeding with portfolio-level narrative.")
+    lines.append("")
+
+    # ── Agent 3 Summary ───────────────────────────────────────────────────────
+    lines.append("WHAT THE RISK ASSESSMENT CONCLUDED (Agent 3)")
+    lines.append("-" * 40)
+    if agent3_output:
+        risk_level   = agent3_output.get("risk_level", "UNKNOWN")
+        final_report = agent3_output.get("final_report", "")
+        lines.append(f"OVERALL RISK CLASSIFICATION: {risk_level}")
+        lines.append(f"Assessed by: DeepSeek R1 chain-of-thought reasoning model")
+        lines.append(f"Assessment timestamp: {agent3_output.get('timestamp','N/A')}")
+        lines.append("")
+        lines.append("Risk assessment report (summarise this for your audience):")
+        # Pass first 1500 chars of the report — enough for narrative context
+        lines.append(final_report[:1500] if final_report else "Not available")
+    else:
+        lines.append("Agent 3 risk assessment not yet completed.")
+        lines.append("Run Agent 3 before generating the executive narrative.")
+    lines.append("")
+
+    # ── The Market Correlation Story ──────────────────────────────────────────
+    lines.append("THE UNIQUE MARKET CORRELATION FINDING")
+    lines.append("-" * 40)
+    lines.append("IBM AML is the only public dataset that gives a complete view")
+    lines.append("across ALL banks — real banks can only see their own transactions.")
+    lines.append("This allowed FinPulse to answer: when banking stocks fell,")
+    lines.append("did money laundering activity increase?")
+    lines.append("September 2022 saw JPM and GS stock decline on several days.")
+    lines.append("The analysis checked whether laundering spiked on those same days.")
+    lines.append("This finding has direct implications for how financial crime")
+    lines.append("relates to market volatility and potential coordinated capital flight.")
+    lines.append("")
+
+    # ── Audience Instructions ─────────────────────────────────────────────────
+    lines.append("NARRATIVE INSTRUCTIONS")
+    lines.append("-" * 40)
+    audience_instructions = {
+        "Board of Directors": (
+            "Write a 1-page board briefing. Assume the audience knows nothing about AML technology. "
+            "Focus on: financial exposure, reputational risk, what actions management has taken, "
+            "and what the board needs to decide or approve. Use dollar amounts prominently. "
+            "End with 3 board-level questions that need to be addressed."
+        ),
+        "Regulatory Filing": (
+            "Write a formal regulatory disclosure narrative. Tone is precise, factual, and complete. "
+            "Reference BSA/AML framework, FinCEN reporting requirements, and FATF guidelines. "
+            "Include: detection methodology, findings, classification rationale, actions taken, "
+            "and timeline. This will be read by compliance examiners. "
+            "Include a formal SAR recommendation with justification."
+        ),
+        "Press Statement": (
+            "Write a 3-paragraph press statement. Tone is measured, transparent, and reassuring. "
+            "Paragraph 1: What was detected and when. Paragraph 2: What action was taken. "
+            "Paragraph 3: What this means for customers and the institution's commitment to compliance. "
+            "No technical jargon. No admission of failure. Emphasise proactive detection."
+        ),
+    }
+    lines.append(audience_instructions.get(audience, "Write a professional executive summary."))
+
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SYSTEM PROMPTS — One per audience
+# ══════════════════════════════════════════════════════════════════════════════
+
+_SYSTEM_PROMPTS = {
+    "Board of Directors": """You are the Chief Compliance Officer of a global financial institution presenting to the Board Risk Committee.
+
+Your job is to translate complex AML investigation findings into a concise, business-language board briefing.
+
+STRICT RULES:
+1. NO technical terms: no "Isolation Forest", no "PySpark", no "Iceberg", no "confidence tier"
+2. TRANSLATE everything: "cross-currency transaction" becomes "money moved through currency conversion to hide its source"
+3. Lead with IMPACT: dollars at risk, reputational consequences, regulatory exposure
+4. Be DECISIVE: boards need clear recommendations, not analysis paralysis
+5. Format: Executive Summary → Key Findings → Actions Taken → Board Decisions Required
+6. Length: equivalent to one printed page — concise but complete
+7. End with exactly 3 numbered board-level decisions or approvals needed
+8. Tone: serious but not alarmist. Confident that the institution detected and responded appropriately.""",
+
+    "Regulatory Filing": """You are the Chief Compliance Officer filing a formal regulatory disclosure with FinCEN.
+
+Your narrative must meet BSA/AML regulatory standards for Suspicious Activity Report documentation.
+
+STRICT RULES:
+1. Precise and factual — every statement must be supportable by data
+2. Reference the regulatory framework: BSA Section 5318(g), FinCEN guidance, FATF Recommendations 1-3
+3. Include: detection method, specific findings, risk classification rationale, timeline, actions taken
+4. Use formal regulatory language — this will be reviewed by compliance examiners
+5. Include a clear SAR filing recommendation with legal basis
+6. Format: Detection Summary → Transaction Analysis → Risk Classification → Regulatory Actions → SAR Recommendation
+7. Never admit to a control failure — frame as proactive detection working as intended
+8. Length: comprehensive — regulatory examiners need the full picture""",
+
+    "Press Statement": """You are the Communications Director of a global financial institution drafting a press statement.
+
+STRICT RULES:
+1. Three paragraphs only — no more
+2. Zero technical terminology — write for a financial journalist with no AML background
+3. Paragraph 1: What was found and when (factual, not alarming)
+4. Paragraph 2: What the institution did about it (decisive, reassuring)
+5. Paragraph 3: What this means (commitment to compliance, customer protection)
+6. Tone: transparent, confident, measured — NOT defensive, NOT alarmist
+7. Never use the word "failure" or "breach"
+8. Emphasise that this was PROACTIVE DETECTION — the system worked
+9. Include one quote from a named (fictional) senior executive
+10. End with boilerplate about the institution's compliance programme""",
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UI COMPONENTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _pipeline_summary_html(
+    agent1_results: list,
+    agent2_context: dict,
+    agent3_output: dict,
+) -> str:
+    """Visual pipeline showing all 4 agents and their contribution."""
+
+    a1_status = "✅" if agent1_results else "⏳"
+    a2_status = "✅" if agent2_context else "⏳"
+    a3_status = "✅" if agent3_output else "⏳"
+    a4_status = "🔄"
+
+    a1_sub = f"{len(agent1_results):,} transactions scored" if agent1_results else "Not run"
+    a2_sub = (f"Account {agent2_context.get('selected_account','?')} investigated"
+              if agent2_context else "No account selected")
+    a3_sub = (f"Risk: {agent3_output.get('risk_level','?')}"
+              if agent3_output else "Assessment pending")
+    a4_sub = "Generating executive narrative"
+
+    agents = [
+        (a1_status, "Agent 1", "Isolation Forest", a1_sub,  "#60A5FA"),
+        (a2_status, "Agent 2", "Groq Llama 3.3",  a2_sub,  "#A78BFA"),
+        (a3_status, "Agent 3", "DeepSeek R1",      a3_sub,  "#FBBF24"),
+        (a4_status, "Agent 4", "Groq Llama 3.3",  a4_sub,  "#34D399"),
+    ]
+
+    cards = ""
+    for i, (status, name, model, sub, color) in enumerate(agents):
+        arrow = (f'<div style="font-size:18px;color:rgba(96,165,250,0.3);'
+                 f'padding:0 6px;align-self:center;">→</div>'
+                 if i < 3 else "")
+        cards += f"""
+        <div style="display:flex;align-items:center;">
+            <div style="background:rgba(15,30,53,0.8);border:1px solid {color}33;
+                        border-radius:8px;padding:12px 16px;min-width:150px;text-align:center;">
+                <div style="font-size:18px;margin-bottom:4px;">{status}</div>
+                <div style="font-size:11px;font-weight:800;color:{color};
+                            text-transform:uppercase;letter-spacing:0.1em;">{name}</div>
+                <div style="font-size:9px;color:#4A6080;margin-top:2px;">{model}</div>
+                <div style="font-size:9px;color:#7E9BB8;margin-top:4px;line-height:1.4;">{sub}</div>
+            </div>
+            {arrow}
+        </div>"""
+
+    return f"""
+    <div style="background:rgba(9,20,40,0.6);border:1px solid rgba(96,165,250,0.1);
+                border-radius:10px;padding:20px 24px;margin-bottom:20px;">
+        <div style="font-size:9px;letter-spacing:0.16em;text-transform:uppercase;
+                    color:#4A6080;font-weight:700;margin-bottom:14px;">
+            FinPulse 4-Agent Pipeline</div>
+        <div style="display:flex;align-items:stretch;gap:0;flex-wrap:wrap;gap:4px;">
+            {cards}
+        </div>
+    </div>
+    """
+
+
+def _audience_card_html(label: str, icon: str, desc: str,
+                         selected: bool, color: str) -> str:
+    bg     = f"rgba({color},0.12)" if selected else "rgba(15,30,53,0.6)"
+    border = f"rgba({color},0.5)"  if selected else "rgba(96,165,250,0.1)"
+    text   = "#FFFFFF"             if selected else "#7E9BB8"
+    return f"""
+    <div style="background:{bg};border:2px solid {border};border-radius:8px;
+                padding:16px 18px;cursor:pointer;text-align:center;height:100%;">
+        <div style="font-size:24px;margin-bottom:8px;">{icon}</div>
+        <div style="font-size:12px;font-weight:800;color:{text};margin-bottom:4px;">{label}</div>
+        <div style="font-size:10px;color:#4A6080;line-height:1.5;">{desc}</div>
+    </div>"""
+
+
+def _narrative_card_html(audience: str, narrative: str, risk_level: str) -> str:
+    """Render the final narrative in a premium document-style card."""
+    risk_colors = {
+        "CRITICAL": "#FF4444",
+        "HIGH":     "#F87171",
+        "MEDIUM":   "#FBBF24",
+        "LOW":      "#34D399",
+        "UNKNOWN":  "#7E9BB8",
+    }
+    risk_color = risk_colors.get(risk_level, "#7E9BB8")
+    icons = {
+        "Board of Directors": "🏛️",
+        "Regulatory Filing":  "⚖️",
+        "Press Statement":    "📰",
+    }
+    icon = icons.get(audience, "📄")
+    today = datetime.now().strftime("%B %d, %Y")
+
+    return f"""
+    <div style="background:linear-gradient(135deg,#0D1B2E 0%,#0F2040 100%);
+                border:1px solid rgba(96,165,250,0.15);border-radius:10px;
+                padding:32px 36px;margin-top:16px;
+                box-shadow:0 8px 32px rgba(0,0,0,0.4);">
+        <!-- Document header -->
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;
+                    margin-bottom:24px;padding-bottom:16px;
+                    border-bottom:1px solid rgba(96,165,250,0.12);">
+            <div>
+                <div style="font-size:9px;color:#4A6080;text-transform:uppercase;
+                            letter-spacing:0.16em;font-weight:700;margin-bottom:4px;">
+                    CONFIDENTIAL — FinPulse Intelligence Report</div>
+                <div style="font-size:20px;font-weight:800;color:#FFFFFF;">
+                    {icon} {audience}</div>
+                <div style="font-size:11px;color:#7E9BB8;margin-top:4px;">
+                    Generated: {today} · FinPulse AML Intelligence Platform v2.0</div>
+            </div>
+            <div style="background:rgba({
+                '255,68,68' if risk_level=='CRITICAL' else
+                '248,113,113' if risk_level=='HIGH' else
+                '251,191,36' if risk_level=='MEDIUM' else
+                '52,211,153'
+            },0.12);border:1px solid {risk_color}44;border-radius:8px;
+                        padding:10px 16px;text-align:center;min-width:100px;">
+                <div style="font-size:9px;color:#4A6080;text-transform:uppercase;
+                            letter-spacing:0.1em;">Risk Level</div>
+                <div style="font-size:18px;font-weight:900;color:{risk_color};
+                            font-family:monospace;">{risk_level}</div>
+            </div>
+        </div>
+        <!-- Narrative content placeholder — rendered separately via st.markdown -->
+    </div>
+    """
+
+
+def _action_items_html(risk_level: str) -> str:
+    """
+    Standard action items based on risk level.
+    These are generic enough to always be relevant,
+    specific enough to be actionable.
+    """
+    urgency_color = {
+        "IMMEDIATE": "#F87171",
+        "24 HOURS":  "#FBBF24",
+        "72 HOURS":  "#A78BFA",
+        "ROUTINE":   "#34D399",
+    }
+
+    items = {
+        "CRITICAL": [
+            ("IMMEDIATE",  "CEO & Board Chair",         "Verbal briefing on critical AML finding"),
+            ("IMMEDIATE",  "Legal & Compliance",        "File SAR with FinCEN within 30 days"),
+            ("IMMEDIATE",  "IT Security",               "Freeze flagged accounts pending review"),
+            ("24 HOURS",   "Correspondent Banks",       "Notify affected correspondent banking partners"),
+            ("72 HOURS",   "External Counsel",          "Engage specialist AML legal counsel"),
+            ("ROUTINE",    "Internal Audit",            "Schedule full AML programme review"),
+        ],
+        "HIGH": [
+            ("IMMEDIATE",  "Chief Compliance Officer",  "Review and approve SAR filing decision"),
+            ("24 HOURS",   "Legal & Compliance",        "Prepare SAR documentation for FinCEN"),
+            ("24 HOURS",   "Relationship Management",   "Enhanced due diligence on flagged accounts"),
+            ("72 HOURS",   "Risk Committee",            "Present findings to Board Risk Committee"),
+            ("ROUTINE",    "Technology Team",           "Calibrate AML model thresholds"),
+        ],
+        "MEDIUM": [
+            ("24 HOURS",   "AML Compliance Team",       "Manual review of multi-indicator accounts"),
+            ("72 HOURS",   "Risk Committee",            "Include findings in next scheduled review"),
+            ("72 HOURS",   "Relationship Management",   "Initiate enhanced customer due diligence"),
+            ("ROUTINE",    "Technology Team",           "Monitor flagged accounts for 90 days"),
+        ],
+        "LOW": [
+            ("72 HOURS",   "AML Compliance Team",       "Document findings in compliance register"),
+            ("ROUTINE",    "Technology Team",           "Continue routine monitoring"),
+            ("ROUTINE",    "Risk Committee",            "Include in quarterly risk report"),
+        ],
+    }
+
+    action_list = items.get(risk_level, items["MEDIUM"])
+    rows = ""
+    for urgency, owner, action in action_list:
+        color = urgency_color.get(urgency, "#7E9BB8")
+        rows += f"""
+        <tr style="border-bottom:1px solid rgba(96,165,250,0.05);">
+            <td style="padding:10px 14px;">
+                <span style="background:rgba(255,255,255,0.04);color:{color};
+                             font-size:10px;font-weight:700;padding:3px 8px;
+                             border-radius:3px;letter-spacing:0.08em;
+                             border:1px solid {color}40;">{urgency}</span>
+            </td>
+            <td style="padding:10px 14px;color:#93C5FD;font-size:12px;font-weight:600;">
+                {owner}</td>
+            <td style="padding:10px 14px;color:#A0B8D0;font-size:12px;">{action}</td>
+        </tr>"""
+
+    return f"""
+    <div style="background:#0F1E35;border:1px solid rgba(96,165,250,0.12);
+                border-radius:8px;overflow:hidden;margin-top:20px;">
+        <div style="padding:12px 16px;background:rgba(96,165,250,0.04);
+                    border-bottom:1px solid rgba(96,165,250,0.12);">
+            <div style="font-size:9px;color:#4A6080;text-transform:uppercase;
+                        letter-spacing:0.14em;font-weight:700;">
+                Recommended Action Items</div>
+        </div>
+        <table style="width:100%;border-collapse:collapse;">
+            <thead>
+                <tr style="border-bottom:1px solid rgba(96,165,250,0.1);">
+                    <th style="padding:8px 14px;text-align:left;font-size:9px;color:#4A6080;
+                               text-transform:uppercase;letter-spacing:0.08em;font-weight:700;">
+                        Urgency</th>
+                    <th style="padding:8px 14px;text-align:left;font-size:9px;color:#4A6080;
+                               text-transform:uppercase;letter-spacing:0.08em;font-weight:700;">
+                        Owner</th>
+                    <th style="padding:8px 14px;text-align:left;font-size:9px;color:#4A6080;
+                               text-transform:uppercase;letter-spacing:0.08em;font-weight:700;">
+                        Action</th>
+                </tr>
+            </thead>
+            <tbody>{rows}</tbody>
+        </table>
+    </div>"""
+
+
+def _detection_timeline_html(agent1_results: list, agent3_output: dict) -> str:
+    """Visual investigation timeline — shows the 4-agent process as a story."""
+    today     = datetime.now()
+    events = [
+        (today - timedelta(hours=3), "🔍 Agent 1 Detection",
+         "AI scanned 5M+ transactions using Isolation Forest",
+         "#60A5FA"),
+        (today - timedelta(hours=2), "🕵️ Agent 2 Investigation",
+         "Compliance analyst investigated highest-priority account",
+         "#A78BFA"),
+        (today - timedelta(hours=1), "⚖️ Agent 3 Risk Assessment",
+         f"DeepSeek R1 classified systemic risk: "
+         f"{agent3_output.get('risk_level','UNKNOWN') if agent3_output else 'Pending'}",
+         "#FBBF24"),
+        (today,                      "📋 Agent 4 Executive Report",
+         "Plain-English narrative generated for decision makers",
+         "#34D399"),
+    ]
+
+    items = ""
+    for i, (ts, title, desc, color) in enumerate(events):
+        connector = (
+            f'<div style="width:2px;height:24px;background:rgba(96,165,250,0.15);'
+            f'margin-left:11px;"></div>'
+            if i < len(events) - 1 else ""
+        )
+        items += f"""
+        <div style="display:flex;gap:14px;align-items:flex-start;">
+            <div style="flex-shrink:0;width:24px;height:24px;border-radius:50%;
+                        background:{color};display:flex;align-items:center;
+                        justify-content:center;font-size:11px;margin-top:2px;">
+            </div>
+            <div style="flex:1;padding-bottom:4px;">
+                <div style="font-size:11px;font-weight:700;color:#FFFFFF;">{title}</div>
+                <div style="font-size:10px;color:#7E9BB8;margin-top:2px;">{desc}</div>
+                <div style="font-size:9px;color:#4A6080;margin-top:2px;">
+                    {ts.strftime('%H:%M')}</div>
+            </div>
+        </div>
+        {connector}"""
+
+    return f"""
+    <div style="background:#0F1E35;border:1px solid rgba(96,165,250,0.12);
+                border-radius:8px;padding:20px 22px;">
+        <div style="font-size:9px;color:#4A6080;text-transform:uppercase;
+                    letter-spacing:0.14em;font-weight:700;margin-bottom:16px;">
+            Investigation Timeline</div>
+        {items}
+    </div>"""
+
+
+def _generate_download_text(
+    audience: str,
+    narrative: str,
+    agent1_results: list,
+    agent3_output: dict,
+) -> str:
+    """Generate plain-text downloadable report."""
+    lines = [
+        "=" * 72,
+        "FINPULSE AML INTELLIGENCE PLATFORM",
+        "EXECUTIVE REPORT — CONFIDENTIAL",
+        "=" * 72,
+        f"Audience    : {audience}",
+        f"Generated   : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Risk Level  : {agent3_output.get('risk_level','UNKNOWN') if agent3_output else 'N/A'}",
+        f"Dataset     : IBM AML HI-Small, 5,078,316 transactions, Sep 2022",
+        "=" * 72,
+        "",
+        narrative,
+        "",
+        "=" * 72,
+        "PIPELINE SUMMARY",
+        "=" * 72,
+        f"Agent 1 (Isolation Forest): {len(agent1_results):,} transactions scored" if agent1_results else "Agent 1: Not run",
+        f"Agent 2 (Groq Llama 3.3):  Account investigation completed",
+        f"Agent 3 (DeepSeek R1):     Risk level = {agent3_output.get('risk_level','N/A')}" if agent3_output else "Agent 3: Not completed",
+        f"Agent 4 (Groq Llama 3.3):  Executive narrative generated",
+        "",
+        "=" * 72,
+        "DISCLAIMER",
+        "=" * 72,
+        "This report was generated by the FinPulse AI-powered AML Intelligence",
+        "Platform using the IBM AML synthetic transaction dataset (NeurIPS 2023).",
+        "All findings relate to synthetic data and should not be construed as",
+        "findings about real individuals, banks, or transactions.",
+        "=" * 72,
+    ]
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_executive_narrative(
+    agent1_results: list,
+    agent2_context: dict = None,
+    agent3_output: dict  = None,
+):
+    """
+    Main Agent 4 render function.
+    Called from app.py with outputs from all three prior agents.
+    """
+    try:
+        client = _get_groq_client()
+    except Exception as e:
+        st.error(f"Groq client initialisation failed: {e}")
+        return
+
+    # Fallback — try session state if not passed directly
+    if not agent2_context:
+        agent2_context = st.session_state.get("agent2_context")
+    if not agent3_output:
+        agent3_output = st.session_state.get("agent3_output")
+
+    risk_level = agent3_output.get("risk_level", "UNKNOWN") if agent3_output else "UNKNOWN"
+
+    # ── Page header ───────────────────────────────────────────────────────────
+    st.markdown(
+        """<div style="margin-bottom:24px;">
+            <div style="font-size:9px;letter-spacing:0.2em;text-transform:uppercase;
+                        color:#4A6080;font-weight:700;margin-bottom:4px;">
+                Agent 4 · Groq Llama 3.3 · Executive Narrative</div>
+            <div style="font-size:22px;font-weight:800;color:#FFFFFF;">
+                Board-Ready Report Generator</div>
+            <div style="font-size:13px;color:#7E9BB8;margin-top:6px;line-height:1.6;">
+                Translates all AI findings into plain-English narratives for
+                boards, regulators, and press. No jargon. Decisions-first format.
+            </div></div>""",
+        unsafe_allow_html=True,
+    )
+
+    # ── Pipeline summary ──────────────────────────────────────────────────────
+    st.markdown(
+        _pipeline_summary_html(agent1_results, agent2_context, agent3_output),
+        unsafe_allow_html=True,
+    )
+
+    # ── Agent 3 status check ──────────────────────────────────────────────────
+    if not agent3_output:
+        st.warning(
+            "⚠️ Agent 3 risk assessment not found. "
+            "Run Agent 3 first for the richest executive narrative. "
+            "Proceeding with available data."
+        )
+    else:
+        st.success(
+            f"✅ All agents complete. Risk level: **{risk_level}**. "
+            f"Ready to generate {risk_level}-tier executive narrative."
+        )
+
+    st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+
+    # ── Audience selector ─────────────────────────────────────────────────────
+    st.markdown(
+        '<div style="font-size:9px;letter-spacing:0.14em;text-transform:uppercase;'
+        'color:#4A6080;margin-bottom:12px;font-weight:700;">Select Report Audience</div>',
+        unsafe_allow_html=True,
+    )
+
+    audience_options = ["Board of Directors", "Regulatory Filing", "Press Statement"]
+    audience_icons   = ["🏛️", "⚖️", "📰"]
+    audience_descs   = [
+        "C-suite & board risk committee\nFocus: exposure, decisions, approvals",
+        "FinCEN / regulatory examiners\nFocus: SAR, legal framework, timeline",
+        "Media & public communications\nFocus: transparency, reassurance",
+    ]
+    audience_colors  = ["96,165,250", "251,191,36", "52,211,153"]
+
+    # Use radio for actual selection, cards for visual
+    selected_audience = st.radio(
+        "audience",
+        options=audience_options,
+        format_func=lambda x: f"{audience_icons[audience_options.index(x)]} {x}",
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+
+    # Visual cards below the radio
+    cols = st.columns(3)
+    for i, (option, icon, desc, color) in enumerate(
+        zip(audience_options, audience_icons, audience_descs, audience_colors)
+    ):
+        with cols[i]:
+            st.markdown(
+                _audience_card_html(
+                    option, icon, desc,
+                    selected=option == selected_audience,
+                    color=color,
+                ),
+                unsafe_allow_html=True,
+            )
+
+    st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+
+    # ── Investigation timeline + action items (side by side) ──────────────────
+    left_col, right_col = st.columns([1, 1])
+    with left_col:
+        st.markdown(
+            _detection_timeline_html(agent1_results, agent3_output),
+            unsafe_allow_html=True,
+        )
+    with right_col:
+        st.markdown(
+            _action_items_html(risk_level),
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
+
+    # ── Generate narrative ────────────────────────────────────────────────────
+    st.markdown(
+        f'<div style="font-size:9px;letter-spacing:0.14em;text-transform:uppercase;'
+        f'color:#4A6080;margin-bottom:12px;font-weight:700;">'
+        f'Executive Narrative — {selected_audience}</div>',
+        unsafe_allow_html=True,
+    )
+
+    cache_key = f"agent4_narrative_{selected_audience}_{risk_level}"
+
+    col_gen, col_clear = st.columns([2, 6])
+    with col_gen:
+        generate_clicked = st.button(
+            "📋 Generate Narrative",
+            type="primary",
+            use_container_width=True,
+        )
+    with col_clear:
+        if st.button("🗑 Clear Narrative", use_container_width=True):
+            if cache_key in st.session_state:
+                del st.session_state[cache_key]
+            st.rerun()
+
+    if generate_clicked or cache_key in st.session_state:
+        if generate_clicked or cache_key not in st.session_state:
+            briefing = _build_narrative_briefing(
+                agent1_results=agent1_results,
+                agent2_context=agent2_context,
+                agent3_output=agent3_output,
+                audience=selected_audience,
+            )
+
+            system_prompt = _SYSTEM_PROMPTS.get(
+                selected_audience,
+                _SYSTEM_PROMPTS["Board of Directors"],
+            )
+
+            with st.spinner(f"Writing {selected_audience} narrative..."):
+                try:
+                    stream = client.chat.completions.create(
+                        model="llama-3.3-70b-versatile",
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user",   "content": briefing},
+                        ],
+                        temperature=0.4,   # slightly higher for natural writing
+                        max_tokens=1200,
+                        stream=True,
+                    )
+
+                    # Document header card
+                    st.markdown(
+                        _narrative_card_html(selected_audience, "", risk_level),
+                        unsafe_allow_html=True,
+                    )
+
+                    # Stream the narrative
+                    stream_box    = st.empty()
+                    full_narrative = ""
+                    for chunk in stream:
+                        delta = chunk.choices[0].delta.content or ""
+                        if delta:
+                            full_narrative += delta
+                            stream_box.markdown(full_narrative)
+
+                    st.session_state[cache_key] = {
+                        "narrative":  full_narrative,
+                        "audience":   selected_audience,
+                        "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "risk_level": risk_level,
+                    }
+
+                except Exception as e:
+                    st.error(f"Groq error: {e}")
+                    return
+
+        else:
+            # Render from cache
+            cached = st.session_state[cache_key]
+            st.markdown(
+                _narrative_card_html(
+                    cached["audience"], "", cached["risk_level"]
+                ),
+                unsafe_allow_html=True,
+            )
+            st.markdown(cached["narrative"])
+
+        # ── Download button ───────────────────────────────────────────────────
+        cached    = st.session_state[cache_key]
+        narrative = cached["narrative"]
+
+        st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+
+        download_text = _generate_download_text(
+            audience=selected_audience,
+            narrative=narrative,
+            agent1_results=agent1_results,
+            agent3_output=agent3_output,
+        )
+
+        col_dl, col_meta = st.columns([2, 6])
+        with col_dl:
+            filename = (
+                f"finpulse_{selected_audience.lower().replace(' ','_')}_"
+                f"{datetime.now().strftime('%Y%m%d_%H%M')}.txt"
+            )
+            st.download_button(
+                label="⬇️ Download Report",
+                data=download_text,
+                file_name=filename,
+                mime="text/plain",
+                use_container_width=True,
+            )
+        with col_meta:
+            st.markdown(
+                f'<div style="font-size:10px;color:#4A6080;padding-top:8px;">'
+                f'Generated: {cached["timestamp"]} · '
+                f'Model: Groq Llama 3.3 70B Versatile · '
+                f'Audience: {selected_audience}'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+        # Save to disk
+        output_dir  = _PROJECT_ROOT / "data" / "ai_reports"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        report_path = output_dir / filename.replace(".txt", ".json")
+        with open(report_path, "w") as f:
+            json.dump({
+                "audience":       selected_audience,
+                "narrative":      narrative,
+                "risk_level":     risk_level,
+                "timestamp":      cached["timestamp"],
+                "agent1_count":   len(agent1_results),
+                "agent2_account": agent2_context.get("selected_account") if agent2_context else None,
+                "agent3_report":  agent3_output.get("final_report","") if agent3_output else "",
+            }, f, indent=2)
+
+        st.info(f"Report also saved to `{report_path.name}`")
+
+    else:
+        # Idle state
+        st.markdown(
+            f"""<div style="background:rgba(15,30,53,0.6);border:1px solid rgba(96,165,250,0.12);
+                            border-radius:8px;padding:28px;text-align:center;">
+                <div style="font-size:28px;margin-bottom:12px;">📋</div>
+                <div style="font-size:14px;font-weight:700;color:#FFFFFF;margin-bottom:6px;">
+                    Ready to generate {selected_audience} narrative</div>
+                <div style="font-size:12px;color:#7E9BB8;line-height:1.7;">
+                    Click <strong>Generate Narrative</strong> to produce a<br>
+                    plain-English executive report for <strong>{selected_audience}</strong>.<br>
+                    All four agent outputs will be synthesised into one coherent story.
+                </div></div>""",
+            unsafe_allow_html=True,
+        )

@@ -30,10 +30,10 @@ logger = get_logger(__name__)
 # Task Definitions
 # ============================================================
 
-@task(name="Transaction Bronze Ingestion", retries=3, retry_delay_seconds=30)
-def ingest_transaction():
+@task(name="Bronze Data Ingestion", retries=3, retry_delay_seconds=30)
+def ingest_bronze_data():
     run_logger = get_run_logger()
-    run_logger.info("Starting transaction ingestion task...")
+    run_logger.info("Starting Bronze ingestion for all sources...")
     run_bronze_ingestion()
     return True
 
@@ -78,6 +78,7 @@ def run_silver_transformation():
     
     notebooks = [
          "notebooks/silver_transactions.ipynb",
+         "notebooks/silver_accounts.ipynb",
          "notebooks/silver_stocks.ipynb"
     ]
     
@@ -179,7 +180,7 @@ def finpulse_full_pipeline():
     logger.info("--- MEDALLION PIPELINE STARTING ---")
     
     # 1. Bronze Layer
-    ingest_transaction()
+    ingest_bronze_data()
     ingest_stocks()
     
     # 2. Silver Layer (Conditional)

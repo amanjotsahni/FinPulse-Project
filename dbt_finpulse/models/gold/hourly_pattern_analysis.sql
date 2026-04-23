@@ -1,8 +1,8 @@
 select
-     step as hour_of_simulation,
-     type,
+     HOUR(timestamp) as hour_of_day,
+     payment_format,
      count(*) as transaction_count,
-     avg(amount) as avg_amount,
-     sum(isFraud) as fraud_count
+     avg(amount_paid) as avg_amount,
+     sum(is_laundering) as fraud_count
 from {{ source('finpulse', 'transactions_silver') }}
-group by 1,2
+group by 1, 2

@@ -1,48 +1,30 @@
 import os
 import time
-import random
-from dotenv import load_dotenv
-load_dotenv()
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-# Robust class-level monkey-patch for curl_cffi to force verify=False
-try:
-    import curl_cffi.requests
-    orig_Session = curl_cffi.requests.Session
-    class PatchedSession(orig_Session):
-        def request(self, method, url, **kwargs):
-            kwargs['verify'] = False
-            return super().request(method, url, **kwargs)
-    curl_cffi.requests.Session = PatchedSession
-except Exception:
-    pass
-
 import requests
-orig_request = requests.Session.request
-def _patched_request(self, method, url, **kwargs):
-    kwargs['verify'] = False
-    return orig_request(self, method, url, **kwargs)
-requests.Session.request = _patched_request
-
 import yfinance as yf 
 import sys
 import pandas as pd
 from datetime import datetime
 from pathlib import Path
 
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 # Add project root to path manually
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
-from config import BRONZE_STOCKS, TICKERS, STOCK_PERIOD, DATA_SOURCE_STOCKS
-
+from config import BRONZE_STOCKS_TARGETS, TICKERS, DATA_SOURCE_STOCKS
 # ============================================================
 # FinPulse — Stock Market Data Ingestion (Bronze Layer)
-# Purpose: Fetch real market data for financial analysis
-# (Optimized with Idempotency to prevent IP blocks)
+# Purpose: Fetch real market data aligned to IBM AML period
+# Date range: 2022-08-15 to 2022-09-30 (fixed, not rolling)
 # ============================================================
+
+# Fixed date range — aligned to IBM AML transaction period
+STOCK_START_DATE = "2022-08-15"
+STOCK_END_DATE   = "2022-09-30"
 
 INGESTION_TIMESTAMP = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -56,16 +38,22 @@ def run_stock_ingestion():
     print("="*60)
 
     partition_date = datetime.now().strftime("%Y-%m-%d")
-    partition_path = Path(BRONZE_STOCKS) / f"date={partition_date}"
+    
+    # ── Check all targets first ───────────────────────────────────
+    all_targets_exist = True
+    for t_dir in BRONZE_STOCKS_TARGETS:
+        partition_path = Path(t_dir) / f"date={partition_date}"
+        if not (partition_path.exists() and list(partition_path.glob("stocks_raw_*.csv"))):
+            all_targets_exist = False
+            break
 
-    # Optimization: Skip if we already have files for today
-    if partition_path.exists() and list(partition_path.glob("stocks_raw_*.csv")):
-        print(f"[{INGESTION_TIMESTAMP}] Skip: Stock data for {partition_date} already exists.")
-        print(f"Directory: {partition_path}")
+    if all_targets_exist:
+        print(f"[{INGESTION_TIMESTAMP}] Skip: Stock data for {partition_date} already exists on all sites.")
         return
 
     # Proceed to fetch
-    print(f"[{INGESTION_TIMESTAMP}] Fetching fresh market data for: {TICKERS}")
+    print(f"[{INGESTION_TIMESTAMP}] Fetching market data for: {TICKERS}")
+    print(f"Date range: {STOCK_START_DATE} to {STOCK_END_DATE}")
     
     all_stocks = []
     for ticker in TICKERS:
@@ -74,14 +62,19 @@ def run_stock_ingestion():
         df = pd.DataFrame()
         for attempt in range(3):
             try:
-                stock = yf.Ticker(ticker)
-                df = stock.history(period=STOCK_PERIOD)
+                # Use standard download 
+                df = yf.download(
+                    ticker, 
+                    start=STOCK_START_DATE, 
+                    end=STOCK_END_DATE, 
+                    progress=False
+                )
                 if not df.empty:
                     break
             except Exception as e:
                 print(f"  Attempt {attempt+1} failed for {ticker}: {e}")
             
-            time.sleep(random.uniform(2, 5) * (attempt + 1))
+            time.sleep(2 * (attempt + 1))
             
         if df.empty:
             print(f"  WARNING: Failed to fetch {ticker}. Skipping.")
@@ -93,7 +86,7 @@ def run_stock_ingestion():
         df['data_source'] = DATA_SOURCE_STOCKS
 
         all_stocks.append(df)
-        print(f" {ticker}:{len(df)} records fetched")
+        print(f" {ticker}: {len(df)} records fetched")
         
         # Polite delay
         time.sleep(random.uniform(2, 4))
@@ -103,16 +96,21 @@ def run_stock_ingestion():
         
     combined_df = pd.concat(all_stocks, ignore_index=True)
 
-    # Save to Bronze Layer
-    os.makedirs(partition_path, exist_ok=True)
+    # Save to all Bronze sites
     timestamp = datetime.now().strftime("%H%M%S")
-    output_file = partition_path / f"stocks_raw_{timestamp}.csv"
-    combined_df.to_csv(output_file, index=False)
+    for t_dir in BRONZE_STOCKS_TARGETS:
+        partition_path = Path(t_dir) / f"date={partition_date}"
+        os.makedirs(partition_path, exist_ok=True)
+        output_file = partition_path / f"stocks_raw_{timestamp}.csv"
+        combined_df.to_csv(output_file, index=False)
+        print(f" Saved to: {output_file}")
 
-    print("\n" + "=" *60)
+    print("\n" + "="*60)
     print("STOCK INGESTION COMPLETE")
-    print(f"Records: {combined_df.shape[0]:,}")
-    print(f"Output: {output_file}")
+    print(f"Records   : {combined_df.shape[0]:,}")
+    print(f"Tickers   : {combined_df['ticker'].nunique()}")
+    print(f"Date range: {combined_df['Date'].min()} → {combined_df['Date'].max()}")
+    print(f"Output    : {output_file}")
     print("="*60)
 
 if __name__ == "__main__":

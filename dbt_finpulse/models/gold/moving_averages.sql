@@ -12,4 +12,4 @@ select
         order by date 
         rows between 29 preceding and current row
      ) as ma_30d 
-from {{ source('finpulse', 'stocks_silver') }}
+from {{ source('finpulse', 'silver_stocks') }}

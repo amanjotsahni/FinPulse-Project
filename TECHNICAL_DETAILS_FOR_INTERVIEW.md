@@ -19,7 +19,7 @@ If a Silver bug is found, you reprocess from Bronze — no need to go back to th
 
 ### FinPulse Ingestion Architecture (Actual)
 ```
-[Yahoo Finance API / PaySim CSV]
+[Yahoo Finance API / IBM AML CSV]
           ↓
     Bronze (Local)
   Hive-partitioned CSV
@@ -31,14 +31,14 @@ If a Silver bug is found, you reprocess from Bronze — no need to go back to th
           ↓
    Parquet Export (Local)
    data/silver/transactions/
-   data/silver/stocks/
+   data/silver/accounts/
           ↓
   Databricks SDK Upload
   /Volumes/workspace/finpulse/staging/
           ↓
   CREATE TABLE AS SELECT (CTAS)
   workspace.finpulse.transactions_silver  (Delta)
-  workspace.finpulse.stocks_silver        (Delta)
+  workspace.finpulse.accounts_silver      (Delta)
           ↓
    dbt Gold Models (Databricks SQL Warehouse)
      9 tables: fraud KPIs, volatility, moving averages...
@@ -56,7 +56,7 @@ PySpark has two kinds of operations:
 | **Transformation** (lazy) | Builds a logical plan. Nothing runs. | `filter`, `withColumn`, `dropDuplicates` |
 | **Action** (eager) | Triggers an actual Spark Job | `count()`, `collect()`, `show()`, `writeTo()` |
 
-**In our code, every `.count()` call inside `apply_silver_transformations` is an Action.** This is intentional to log progress at each step, but in production you would minimise `.count()` calls because each one is a full dataset scan — 6.3M rows every time.
+**In our code, every `.count()` call inside `apply_silver_transformations` is an Action. This is intentional to log progress at each step, but in production you would minimise `.count()` calls because each one is a full dataset scan — 5.2M rows every time.**
 
 ```python
 initial_count = df.count()                    # ACTION — triggers job
@@ -84,7 +84,7 @@ df = df.filter(F.col("amount") > 0)
 
 ### 2.3 `withColumn()` — Adding / Replacing Columns
 ```python
-df = df.withColumn("is_balance_discrepancy", F.when(...).otherwise(False))
+df = df.withColumn("is_cross_currency", F.when(...).otherwise(False))
 ```
 - Adds a new column or replaces an existing one with the same name.
 - Returns a **new DataFrame** — PySpark DataFrames are immutable. Every `withColumn` creates a new logical plan node.
@@ -95,21 +95,18 @@ df = df.withColumn("is_balance_discrepancy", F.when(...).otherwise(False))
 ### 2.4 `F.when() / .otherwise()` — Conditional Column Logic
 ```python
 df = df.withColumn(
-    "is_balance_discrepancy",
+    "is_cross_currency",
     F.when(
-        (F.col("type").isin(["TRANSFER", "CASH_OUT"]))
-        & (F.col("oldbalanceOrg") > 0)
-        & (F.round(F.col("oldbalanceOrg") - F.col("amount"), 2)
-           != F.round(F.col("newbalanceOrig"), 2)),
+        (F.col("Payment_Currency") != F.col("Receiving_Currency")),
         True,
     ).otherwise(False),
 )
 ```
 - Equivalent to SQL `CASE WHEN ... THEN ... ELSE ... END`.
 - Conditions use `&` (AND), `|` (OR), `~` (NOT) — **not Python's `and`/`or`/`not`** (those don't work on Column objects).
-- `F.round(..., 2)` used deliberately to handle floating-point precision issues — without it, `0.1 + 0.2 != 0.3` in floating-point math, so `oldbalance - amount != newbalance` would produce false positives.
+- `F.round(..., 2)` used deliberately to handle floating-point precision issues — without it, `0.1 + 0.2 != 0.3` in floating-point math, causing false results in currency comparisons.
 
-**The `isin()` optimisation:** `F.col("type").isin(["TRANSFER", "CASH_OUT"])` is more efficient than `(F.col("type") == "TRANSFER") | (F.col("type") == "CASH_OUT")` because Spark can compile `isin` down to a single hash lookup.
+**The `isin()` optimisation:** `F.col("payment_format").isin(["Wire Transfer", "ACH"])` is more efficient than chained `|` comparisons because Spark can compile `isin` down to a single hash lookup.
 
 ---
 
@@ -130,13 +127,13 @@ We need the mean as a Python float scalar to use in the next `withColumn`. Spark
 
 ### 2.6 `dropDuplicates()` — Deduplication
 ```python
-df = df.dropDuplicates(["nameOrig", "step", "amount", "type"])
+df = df.dropDuplicates(["Account", "transaction_timestamp", "Amount_Paid", "Payment_Format"])
 ```
 - Drops rows where all specified columns have identical values.
 - This is a **shuffle operation** — Spark has to redistribute data across partitions so that rows with the same key end up on the same executor to be compared. This is the most expensive operation in our pipeline.
 - Without arguments, `dropDuplicates()` considers all columns — usually not what you want.
 
-**Why these 4 columns?** This is our **business key** for a transaction: same sender (`nameOrig`), same simulation step, same amount, same transaction type = duplicate event.
+**Why these 4 columns?** This is our **business key** for an IBM AML transaction: same timestamp + same sending bank + same account + same amount paid = same real-world transaction event.
 
 ---
 
@@ -248,9 +245,9 @@ df = df.withColumn("moving_avg_7d", F.round(F.avg("close").over(window_7d), 4))
 A shuffle happens when Spark needs to **redistribute data across partitions** — moving rows from one executor to another across the network (or disk in local mode).
 
 ```
-Partition 1: [row_a, row_d, row_g]         After groupBy("type"):
-Partition 2: [row_b, row_e, row_h]   →→→   Partition 1: all "TRANSFER" rows
-Partition 3: [row_c, row_f, row_i]         Partition 2: all "CASH_OUT" rows
+Partition 1: [row_a, row_d, row_g]         After groupBy("payment_format"):
+Partition 2: [row_b, row_e, row_h]   →→→   Partition 1: all "Wire Transfer" rows
+Partition 3: [row_c, row_f, row_i]         Partition 2: all "ACH" rows
 ```
 
 **Operations that trigger a shuffle:**
@@ -280,19 +277,19 @@ Partition 3: [row_c, row_f, row_i]         Partition 2: all "CASH_OUT" rows
 
 ### 3.3 Data Skew — The Problem We Would Face at Scale
 **The Problem:**  
-In financial transaction data, `CASH_OUT` and `TRANSFER` are dominant transaction types (over 80% of records). If we ever do a `groupBy("type")`, one partition (containing `CASH_OUT`) would have 5M rows while others have 100K — Spark ends up with one "straggler" task that takes 10× longer than others.
+In financial transaction data, dominant payment formats (e.g., Wire Transfer) may account for a disproportionate share of records. If we do a `groupBy("payment_format")`, one partition gets far more rows and becomes a straggler — every other executor sits idle waiting for it.
 
 **FinPulse context:** We deliberately **avoid `groupBy` in our Silver transformation** — we use `F.when/otherwise` for conditional column creation instead, which is a **partition-local transformation** (no shuffle needed).
 
 **If we did need to groupBy:**
 ```python
-# BAD: causes skew — all CASH_OUT rows on one partition
-df.groupBy("type").agg(F.count("*").alias("count"))
+# BAD: causes skew — dominant payment_format rows on one partition
+df.groupBy("payment_format").agg(F.count("*").alias("count"))
 
 # GOOD: salt the key to distribute skew across multiple partitions
-from pyspark.sql.functions import concat, lit, floor, rand
-df_salted = df.withColumn("salted_type", concat(F.col("type"), lit("_"), (F.rand() * 5).cast("int")))
-df_salted.groupBy("salted_type").agg(F.count("*").alias("count"))
+from pyspark.sql.functions import concat, lit, rand
+df_salted = df.withColumn("salted_fmt", concat(F.col("payment_format"), lit("_"), (F.rand() * 5).cast("int")))
+df_salted.groupBy("salted_fmt").agg(F.count("*").alias("count"))
 # Then aggregate the salt away in a second pass
 ```
 
@@ -331,15 +328,15 @@ Used when both sides are large. This is what causes most shuffle-related crashes
 ```python
 from pyspark.sql.functions import broadcast
 
-# Small lookup table (e.g., transaction type descriptions)
-type_lookup = spark.createDataFrame([
-    ("TRANSFER", "Bank Transfer"),
-    ("CASH_OUT", "Cash Withdrawal"),
+# Small lookup table (e.g., payment format descriptions)
+format_lookup = spark.createDataFrame([
+    ("Wire Transfer", "International wire"),
+    ("ACH", "Automated clearing house"),
     ...
-], ["type", "type_description"])
+], ["payment_format", "format_description"])
 
 # Broadcast the small table — it gets sent to every executor, NO shuffle on large side
-silver_df.join(broadcast(type_lookup), on="type", how="left")
+silver_df.join(broadcast(format_lookup), on="payment_format", how="left")
 ```
 **When to use:** One side of the join is small enough to fit in executor memory (< 10–20MB typically).  
 `spark.sql.autoBroadcastJoinThreshold` — Spark auto-broadcasts if a table is under this threshold (default 10MB).
@@ -347,8 +344,8 @@ silver_df.join(broadcast(type_lookup), on="type", how="left")
 #### Bad Join Pattern — What to Avoid
 ```python
 # BAD: joining two large DataFrames on a high-cardinality key without any hints
-silver_df.join(another_large_df, on="nameOrig")  
-# nameOrig has 6M unique values → massive shuffle, possible OOM
+silver_df.join(another_large_df, on="account")  
+# account has millions of unique values → massive shuffle, possible OOM
 ```
 
 **For our Gold layer future joins (e.g., joining transactions with account metadata):**
@@ -457,11 +454,11 @@ if not os.path.exists(target_file):
 **Interview point:** *"`ref()` is for dbt-managed models in the project DAG. `source()` is for externally-managed tables. Getting this wrong breaks lineage, causes compilation errors, and prevents impact analysis. Understanding this distinction is a core dbt competency."*
 
 ### Bug 8: Databricks SQL Boolean Aggregation Type Error
-**Symptom:** `[DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve sum(is_balance_discrepancy) due to BOOLEAN type.`  
-**Root Cause:** `is_balance_discrepancy` was engineered as a BOOLEAN column in the Silver Parquet. Databricks SQL (Delta Lake) follows ANSI SQL strictly — `SUM()` over BOOLEAN is undefined in ANSI SQL and thus rejected. Other SQL engines (PostgreSQL, BigQuery) implicitly cast BOOLEAN to integer for aggregation; Databricks does not.  
+**Symptom:** `[DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve sum(is_cross_currency) due to BOOLEAN type.`  
+**Root Cause:** `is_cross_currency` is engineered as a BOOLEAN column in the Silver Parquet. Databricks SQL (Delta Lake) follows ANSI SQL strictly — `SUM()` over BOOLEAN is undefined in ANSI SQL and thus rejected. Other SQL engines (PostgreSQL, BigQuery) implicitly cast BOOLEAN to integer for aggregation; Databricks does not.  
 **Fix:** Explicit CAST before aggregation in all affected Gold SQL models:
 ```sql
-SUM(CAST(is_balance_discrepancy AS INT)) AS discrepancy_count
+SUM(CAST(is_cross_currency AS INT)) AS cross_currency_count
 ```
 **Interview point:** *"SQL dialect differences in type strictness are a real production pain point. Databricks follows ANSI SQL more closely than many other engines. Always test Gold SQL on the actual target engine, not assumptions from another dialect."*
 
@@ -525,7 +522,7 @@ TIMESTAMP AS OF '2026-04-06 20:00:00';
 ```sql
 SELECT 
     COUNT(*) as total,
-    SUM(CAST(isFraud AS INT)) as fraud_count,
+    SUM(CAST(is_laundering AS INT)) as fraud_count,
     ROUND(AVG(amount), 2) as avg_amount
 FROM local.finpulse.silver_transactions;
 ```
@@ -679,7 +676,136 @@ Result: same notebook runs identically on Windows laptop, Google Drive mount, an
 
 ---
 
-## 9. Cloud Ingestion Engineering: Staging Volume + CTAS
+## 9. Parquet Output Engineering: Spark Partition Sizing & File Count Control
+
+### 9.1 Why the File Count Changed (16 → 8 Files)
+
+After fixing the duplicate partition bug (which created 10,156,632 rows = 2× data), the clean Silver write contains 5,078,316 rows. Spark auto-sizes output partitions based on data volume:
+
+```
+Old run: 10,156,632 rows → Spark allocated 16 output tasks → 16 .parquet files
+New run:  5,078,316 rows → Spark allocated  8 output tasks →  8 .parquet files
+```
+
+This is **expected and correct** — Spark's default task sizing targets ~128MB per partition. At ~1.85GB total and snappy compression (~3× ratio), 8 files of ~19MB each is the right-sized output.
+
+**Why this matters for cloud ingestion:**
+Fewer, larger files = fewer SDK upload calls = less SSL handshake overhead. The previous 16-file run exposed a 5-minute SSL timeout on the last file (`part-00007`). The 8-file version cuts total upload time roughly in half.
+
+### 9.2 PySpark UUID-Based Output Filenames
+
+The new output files use UUID-style names:
+```
+part-00000-411ca40e-36a6-437c-875b-6127dc4559e8-c000.snappy.parquet
+```
+
+This is the DataFrameWriterV2 naming convention when writing flat Parquet (not Iceberg). The UUID is the **query execution ID** — unique per Spark job run. It guarantees no filename collision when multiple pipeline runs write to the same directory, even before the `overwrite` mode takes effect.
+
+The `.crc` sidecar files are **Hadoop CRC32 checksums** — written alongside each Parquet file to detect disk corruption. They are completely harmless and are correctly ignored by:
+- `cloud_promotion.py`'s `glob("*.parquet")` pattern
+- Databricks CTAS `parquet.'*.parquet'` wildcard
+
+### 9.3 Clean-Before-Load Pattern in `cloud_promotion.py`
+
+Every run of `cloud_promotion.py` follows a strict **Clean-Before-Load** sequence:
+
+```python
+# Step 1: Delete all existing files in the staging Volume folder
+files = w.files.list_directory_contents(base_vol_path)
+for f in files:
+    w.files.delete(f.path)  # Remove stale files — no accumulation possible
+
+# Step 2: Upload fresh Parquet files from latest Silver partition
+for f in parquet_files:
+    w.files.upload(remote_path, fdata, overwrite=True)
+
+# Step 3: DROP TABLE + CREATE TABLE AS SELECT (atomic full replace)
+cursor.execute("DROP TABLE IF EXISTS ...")
+cursor.execute("CREATE TABLE ... AS SELECT * FROM parquet.'...'")
+```
+
+**Why not just `overwrite=True` without DELETE first?**  
+If the previous run had 16 files and the new run has 8 files, `overwrite=True` would update the 8 files that match but leave 8 stale files in the Volume. The CTAS glob `*.parquet` would then read all 16 files — resulting in double the rows. The explicit Volume cleanup prevents this.
+
+### 9.4 SSL Timeout Handling — 3-Attempt Retry
+
+The Databricks SDK's file upload uses a default ~5-minute HTTP timeout. On large Parquet files (~19MB), intermittent SSL EOF errors occur due to network jitter:
+
+```python
+for attempt in range(1, 4):
+    try:
+        with f.open("rb") as fdata:
+            w.files.upload(remote_path, fdata, overwrite=True)
+        break  # success — exit retry loop
+    except Exception as e:
+        if attempt == 3:
+            logger.error(f"FAILED after 3 attempts: {f.name} — {e}")
+            raise
+        logger.warning(f"Attempt {attempt} failed ({e.__class__.__name__}), retrying...")
+        import time; time.sleep(5)
+```
+
+**Why 3 attempts with 5s sleep:**
+- SSL EOF is almost always transient (brief network blip, not a permanent failure).
+- 5s sleep allows TCP connection state to fully reset before the next attempt.
+- Raising on attempt 3 ensures pipeline fails loudly instead of silently producing an incomplete table.
+
+**Interview point:** *"SSL timeouts on large binary uploads are an operational reality in any cloud SDK. The retry wrapper is a production reliability pattern — identical to how S3 multipart uploads handle transient failures, just at the SDK level."*
+
+---
+
+## 9.5 Evidence-Based Synthetic Wire Laundering Labels
+
+The IBM AML dataset has **0 confirmed Wire laundering labels** in the raw data — not because Wire is safe, but because the simulation was seeded with ACH/Cheque as the primary laundering formats. Wire transfers represent the largest individual transaction sizes ($2B+ in some cases) yet showed 0% laundering rate, which misrepresented the real AML risk profile.
+
+**The problem with random labeling:**
+Random synthetic labels are noise — they teach the model nothing and contaminate ground truth.
+
+**Evidence-based approach — 4 AML signals required (2+ must fire simultaneously):**
+
+| Signal | Definition | AML Basis |
+|---|---|---|
+| Signal A: Dirty bank | `from_bank` in top-10 ACH laundering banks | These banks already confirmed suspicious in other formats |
+| Signal B: Round amount | `amount_paid % 1000 < $1` | Structuring signal — round numbers suggest manual entry/coordination |
+| Signal C: Large cross-bank | `amount > $1M AND from_bank != to_bank` | Integration-phase capital movement at scale |
+| Signal D: Multi-channel account | Account confirmed fraudulent in ACH AND has large Wire activity | Same entity, different payment rails |
+
+```python
+signal_count = signal_a.cast("int") + signal_b.cast("int") + signal_c.cast("int") + signal_d.cast("int")
+
+df = df.withColumn("is_laundering",
+    F.when(
+        (F.col("payment_format") == "Wire") &
+        (F.col("from_bank") != F.col("to_bank")) &
+        (F.col("amount_paid") > 200_000) &
+        (signal_count >= 2),  # at least 2 independent signals must agree
+        1
+    ).otherwise(F.col("is_laundering"))
+)
+```
+
+**Result:** 1,057 Wire transactions labeled suspicious out of 171,854 (0.61% rate) — realistic, defensible, evidence-grounded.
+
+**Interview point:** *"The synthetic label strategy mirrors how financial intelligence units actually build training data: you don't randomly assign fraud labels, you identify transactions that satisfy multiple independent AML red flags simultaneously. Two-signal requirement prevents false positives."*
+
+---
+
+## 9.6 Duplicate Partition Detection & Data Integrity
+
+During development, the Silver notebook was run twice on the same date, creating a duplicate partition with 10,156,632 rows (exactly 2× correct). Detection pattern:
+
+```python
+# Verify expected row count before uploading
+total = sum(len(pd.read_parquet(f)) for f in partition.glob("*.parquet"))
+# Expected: ~5,078,316 (Bronze 5,178,345 - 29 duplicates ≈ 5.1M)
+# Detected: 10,156,632 → duplicate partition → delete and rerun
+```
+
+**Why this matters:** A CTAS from a doubled partition produces a doubled Delta table. All downstream Gold models would show 2× transaction counts, 2× laundering rates, and incorrect fraud statistics. **Always verify Silver row count before cloud promotion.**
+
+---
+
+## 10. Cloud Ingestion Engineering: Staging Volume + CTAS
 
 ### The Problem with Standard Spark-to-SQL Pushes
 When we initially tried standard Databricks Connect `spark.createDataFrame(pandas_df).write.saveAsTable(table)`, the notebook hung for 22+ minutes without producing any log output. Root cause: the driver serializes all 6.36M rows through Python → JVM → remote SQL endpoint → deserialize → write. Each network round-trip is synchronous, and the SQL endpoint treats each batch as a separate statement.
@@ -697,7 +823,7 @@ from databricks.sdk import WorkspaceClient
 
 w = WorkspaceClient()  # uses DATABRICKS_HOST + DATABRICKS_TOKEN from env
 
-for f in Path("data/silver/transactions/date=2026-04-05").glob("*.parquet"):
+for f in Path("data/silver/transactions/date=2026-04-20").glob("*.parquet"):
     remote = f"/Volumes/workspace/finpulse/staging/transactions/{f.name}"
     with f.open("rb") as fdata:
         w.files.upload(remote, fdata)  # direct binary transfer to object storage
@@ -745,14 +871,19 @@ dbt_finpulse/
 ├── models/
 │   ├── sources.yml              ← External Silver table registration
 │   └── gold/
-│       ├── balance_discrepancy_summary.sql
+│       ├── aml_risk_indicators.sql
+│       ├── cross_bank_flow.sql
 │       ├── daily_stock_summary.sql
 │       ├── daily_transaction_summary.sql
+│       ├── entity_laundering_profile.sql
+│       ├── flagged_account_transactions.sql
 │       ├── fraud_rate_by_type.sql
 │       ├── high_risk_accounts.sql
 │       ├── hourly_pattern_analysis.sql
+│       ├── investigation_queue.sql
 │       ├── moving_averages.sql
 │       ├── stocks_performance_ranking.sql
+│       ├── transaction_market_context.sql
 │       └── volatility_metrics.sql
 └── dbt_project.yml              ← gold: +materialized: table
 ```
@@ -767,6 +898,7 @@ sources:
     schema: finpulse
     tables:
       - name: transactions_silver
+      - name: accounts_silver
       - name: stocks_silver
 ```
 In model SQL: `FROM {{ source('finpulse', 'transactions_silver') }}`
@@ -797,12 +929,12 @@ FROM {{ source('finpulse', 'stocks_silver') }}
 **2. `high_risk_accounts` — BOOLEAN cast required for Databricks**
 ```sql
 SELECT
-    nameOrig,
+    account,
     COUNT(*) AS total_transactions,
-    SUM(CAST(is_balance_discrepancy AS INT)) AS discrepancy_count,  -- MUST cast
-    SUM(amount) AS total_amount_transacted
+    SUM(CAST(is_cross_currency AS INT)) AS cross_currency_count,  -- MUST cast
+    SUM(amount_paid) AS total_amount_transacted
 FROM {{ source('finpulse', 'transactions_silver') }}
-WHERE is_balance_discrepancy = true
+WHERE risk_flag = true
 GROUP BY 1
 HAVING COUNT(*) > 1
 ```
@@ -812,8 +944,8 @@ HAVING COUNT(*) > 1
 SELECT
     type,
     COUNT(*) AS total_transactions,
-    SUM(isFraud) AS fraud_count,
-    ROUND(SUM(isFraud) * 100.0 / COUNT(*), 4) AS fraud_rate_pct
+    SUM(is_laundering) AS fraud_count,
+    ROUND(SUM(is_laundering) * 100.0 / COUNT(*), 4) AS fraud_rate_pct
 FROM {{ source('finpulse', 'transactions_silver') }}
 GROUP BY 1
 ```
@@ -832,14 +964,14 @@ GROUP BY 1
 **Q: Why does `.count()` called multiple times in the pipeline hurt performance?**
 > Each `.count()` is an Action that re-triggers the full DAG from source — reading 6.3M rows from disk each time. With 8 count calls, we scan the dataset 8× in dev mode. In production, cache before the first count: `df.persist(StorageLevel.MEMORY_AND_DISK)`, run all counts, then `df.unpersist()`. Caching converts disk reads to memory reads for all subsequent actions.
 
-**Q: Why did you use `dropDuplicates([4 columns])` instead of all columns or just `nameOrig`?**
-> All columns: misses duplicates where metadata columns (like `ingestion_timestamp`) differ — same real transaction, different metadata. Just `nameOrig`: one account makes many transactions, so nameOrig alone isn't unique. The 4-column business key (sender + step + amount + type) represents the same real-world event, regardless of when or how many times it was ingested. This is domain logic turned into engineering logic.
+**Q: Why did you use `dropDuplicates([4 columns])` instead of all columns or just `account`?**
+> All columns: misses duplicates where metadata columns (like `ingestion_timestamp`) differ — same real transaction, different metadata. Just `account`: one account makes many transactions, so account alone isn't unique. The 4-column business key (timestamp + from_bank + account + amount_paid) represents the same IBM AML transaction event, regardless of when or how many times it was ingested. This is domain logic turned into engineering logic.
 
 **Q: What's the risk of `inferSchema=True` in production?**
 > Doubles read cost (file scanned twice — once for schema, once for data). Worse: guesses types from the first N rows. If row N+1 has `"N/A"` in an integer column, inference produced the wrong type at startup and the row silently null-casts or hard-fails. Always define `StructType` explicitly in production. Cost: upfront schema definition. Benefit: deterministic types regardless of data content.
 
-**Q: How does `F.round()` eliminate false positives in balance discrepancy detection?**
-> IEEE 754 can't represent all decimal fractions exactly. `1000000.0 - 999000.5` computes to `999.4999999999954` at machine precision — not `999.5`. Without rounding, `oldbalance - amount ≠ newbalance` is True for valid transactions. `F.round(..., 2)` normalizes both sides to cent precision before comparison — same principle banks use by working in integer cents internally.
+**Q: Why use `F.round()` in financial comparisons?**
+> IEEE 754 can't represent all decimal fractions exactly. `1000000.0 - 999000.5` computes to `999.4999999999954` at machine precision — not `999.5`. Without rounding, float comparisons against thresholds produce false results. `F.round(..., 2)` normalizes to cent precision before comparison — same principle banks use by working in integer cents internally.
 
 **Q: Why did you use `source()` instead of `ref()` in your dbt Gold models?**
 > `ref()` is for models this dbt project manages — it creates a compile-time dependency in the DAG and tells dbt to build that model. `source()` is for externally-managed tables — dbt knows about them for lineage documentation but doesn't build or own them. Our Silver tables are pushed via Python SDK — they're external. Using `ref()` for them causes a compilation error: dbt looks for a .sql model file that doesn't exist.
@@ -937,9 +1069,9 @@ The AI layer is a **4-agent inference system** that sits on top of the completed
 
 ```
 Gold Layer (Databricks)               AI Intelligence Layer (Streamlit)
-  fraud_rate_by_type         ──────►  Agent 1: HUNT     (Isolation Forest)
-  high_risk_accounts         ──────►  Agent 2: INVESTIGATE (Gemini RAG)
-  balance_discrepancy_summary ─────►  Agent 3: REASON   (DeepSeek R1)
+  aml_risk_indicators        ──────►  Agent 1: HUNT     (Isolation Forest)
+  investigation_queue        ──────►  Agent 2: INVESTIGATE (Groq Llama 3.3 RAG)
+  flagged_account_transactions ────►  Agent 3: REASON   (DeepSeek R1)
   stocks_performance_ranking ──────►  Agent 4: BRIEF    (PDF Reporting)
 ```
 
@@ -950,30 +1082,55 @@ Gold Layer (Databricks)               AI Intelligence Layer (Streamlit)
 ## 16.1 Agent 1: HUNT — Complete Technical Dissection
 
 ### 16.1.1 The Problem It Solves
-From 6.36M raw transaction records, the Gold dbt model `balance_discrepancy_summary` already pre-filtered to rows with accounting discrepancies. Agent 1 takes this pre-filtered set and answers: **"Which of these discrepancies are actually fraudulent, and which are just accounting noise?"**
+From 5M+ IBM AML transaction records, Agent 1 reads the Gold `aml_risk_indicators` table and scores: **"Which transactions are most anomalous, using both ML and domain rules?"**
+
+**Critical design fix — removed `WHERE risk_flag = true` pre-filter:**
+
+The original `aml_risk_indicators.sql` had `WHERE risk_flag = true` which pre-filtered to only already-suspicious rows. This broke Isolation Forest:
+
+```
+Without full population → model trains ONLY on suspicious rows
+→ No "normal" baseline established
+→ All rows look equally suspicious relative to each other
+→ Scores are meaningless — contamination threshold fires on noise
+```
+
+The fix: expose the **full Silver table** to Isolation Forest, with stratified sampling at inference time:
+
+```sql
+-- aml_risk_indicators.sql — NO FILTER
+SELECT account as account_id, from_bank, to_bank, payment_format,
+       amount_paid as amount, receiving_currency, payment_currency,
+       is_cross_currency, is_high_value_wire,
+       is_laundering as is_fraud, timestamp as txn_time
+FROM {{ source('finpulse', 'transactions_silver') }}
+-- Full population — Isolation Forest needs normal baseline rows
+```
+
+**Interview point:** *"Isolation Forest is unsupervised — it learns what 'normal' looks like and flags departures. If you pre-filter to only suspicious rows, you remove the normal baseline. The model has nothing to contrast against. This is a fundamental ML architecture mistake that was silently producing garbage scores."*
 
 ### 16.1.2 Data Loading — Stratified Sampling Pattern
 
-**Source table:** `finpulse.balance_discrepancy_summary` (Gold layer)  
-**Columns fetched:** `account_id, type, amount, oldbalanceOrg, newbalanceOrig, oldbalanceDest, newbalanceDest, balance_gap, is_fraud`
+**Source table:** `finpulse.aml_risk_indicators` (Gold layer)  
+**Columns fetched:** `account_id, Payment_Format, amount, is_cross_currency, is_high_value_wire, is_fraud`
 
 **Why stratified, not random:**
 
-| Sampling Method | Fraud rows in 50K sample | Representation |
-|---|---|---|
-| Pure random 50K | ~65 rows (0.13%) | ❌ Insufficient for model to see fraud cluster |
-| Stratified | ALL 8,197 fraud + 50K normal | ✅ Full fraud signal preserved |
+| Sampling Method | Result |
+|---|---|
+| Pure random 50K | Very few confirmed laundering rows — model barely sees positive cases |
+| Stratified | ALL confirmed laundering + 50K normal via TABLESAMPLE — full signal preserved |
 
 ```python
-# Step A: Always include ALL fraud rows
-cursor.execute("... WHERE is_fraud = 1")
-df_fraud   # 8,197 rows — never sampled away
+# Step A: Always include ALL confirmed laundering rows
+cursor.execute("... FROM aml_risk_indicators WHERE is_fraud = 1")
+df_fraud   # all confirmed laundering rows
 
-# Step B: Random 50K normal via Databricks-native ORDER BY RAND()
-cursor.execute("... WHERE is_fraud = 0 ORDER BY RAND() LIMIT 50000")
-df_normal  # 50,000 rows
+# Step B: 10% TABLESAMPLE of normal rows, capped at 50K
+cursor.execute("... FROM aml_risk_indicators TABLESAMPLE (10 PERCENT) WHERE is_fraud = 0 LIMIT 50000")
+df_normal  # 50,000 normal rows
 
-df = pd.concat([df_fraud, df_normal])  # 58,197 rows total
+df = pd.concat([df_fraud, df_normal])
 ```
 
 **Databricks Decimal → Python float conversion:**
@@ -987,19 +1144,101 @@ for col in float_cols:
 
 ---
 
-### 16.1.3 Feature Engineering — 5 Features from First Principles
+### 16.1.2b IBM AML Dataset Format Correctness — `"Wire"` not `"Wire Transfer"`
 
-All features are derived from domain knowledge of PaySim fraud mechanics, not from correlation analysis.
+A critical data discovery during development: the IBM AML HI-Small dataset uses `"Wire"` as the payment format string — **not** `"Wire Transfer"` as assumed from the column description.
 
-| Feature | Formula | Why It's a Fraud Signal |
+```python
+# WRONG — matched zero rows in IBM AML dataset
+df["is_wire"] = (df["Payment_Format"] == "Wire Transfer").astype(int)
+
+# CORRECT — matches IBM AML actual values
+df["is_wire"] = (df["Payment_Format"].str.lower().str.strip() == "wire").astype(int)
+```
+
+**Why this mattered:**
+- Rule 1 (`is_high_value_wire`) was computing `(payment_format == "Wire Transfer") AND amount > 100K` → matched 0 rows → Rule 1 never fired → all Wire transactions scored as LOW tier regardless of amount
+- The Silver notebook's `is_high_value_wire` column also used the wrong string → 0 rows flagged
+- `fraud_rate_by_type` showed Wire = 0% laundering — misleading since it was a data string mismatch, not real clean data
+
+**Fix applied in both places:**
+1. Silver notebook: `F.col("payment_format") == "Wire"` (Spark, case-sensitive after `.lower()`)  
+2. Agent 1: `.str.lower().str.strip() == "wire"` (pandas, defensive against whitespace)
+
+**IBM AML actual Payment Format values:** `Wire`, `ACH`, `Cheque`, `Credit Card`, `Cash`, `Bitcoin`, `Reinvestment`
+
+**Interview point:** *"A single string mismatch caused an entire payment category to show 0% detection. This is why you always validate feature engineering against the actual source data values — not documentation assumptions. We ran a DataFrame `.value_counts()` on the format column and discovered the discrepancy immediately."*
+
+---
+
+### 16.1.2c Bank Name Resolution in `cross_bank_flow` — JOIN via Representative Account
+
+The IBM AML dataset uses numeric bank IDs (1, 10, 11, 802...) internally. The `accounts_silver` table has a `bank_name` column ("First Bank of Dallas") but **no numeric bank ID column** — bank names are only accessible via `account_number → bank_name` join.
+
+**Problem:** `cross_bank_flow` aggregates by `from_bank`/`to_bank` (numeric IDs). The UI was showing corridor charts with raw numbers (802 → 11) — unreadable by stakeholders.
+
+**Initial wrong approach:** `REGEXP_EXTRACT(bank_name, '[0-9]+')` — tried to extract a number from a name like "First Bank of Dallas". Always returned NULL.
+
+**Correct approach — store representative account during aggregation, then join:**
+
+```sql
+aggregated AS (
+    SELECT
+        from_bank, to_bank,
+        COUNT(*) AS transaction_count,
+        SUM(is_laundering) AS laundering_count,
+        ROUND(SUM(is_laundering)*100.0/NULLIF(COUNT(*),0),4) AS laundering_rate_pct,
+        FIRST(account)   AS sample_from_account,   -- save one account from this corridor
+        FIRST(account_1) AS sample_to_account       -- save one receiving account
+    FROM base
+    GROUP BY from_bank, to_bank
+)
+SELECT agg.*,
+    COALESCE(a1.bank_name, CONCAT('Institution ', CAST(agg.from_bank AS STRING))) AS from_bank_name,
+    COALESCE(a2.bank_name, CONCAT('Institution ', CAST(agg.to_bank   AS STRING))) AS to_bank_name
+FROM aggregated agg
+LEFT JOIN accounts_silver a1 ON agg.sample_from_account = a1.account_number
+LEFT JOIN accounts_silver a2 ON agg.sample_to_account   = a2.account_number
+```
+
+**The pattern:** Use `FIRST(account)` to capture a representative account per corridor during aggregation. Then join `accounts_silver` on `account_number` to resolve `bank_name`. `COALESCE` with `'Institution {id}'` fallback ensures no NULLs in the UI if an account isn't found.
+
+**Interview point:** *"When a lookup table doesn't have a direct join key, use a stored representative row from the aggregation. This is the 'bridge key' pattern — FIRST(account) acts as the bridge between the aggregated bank ID and the accounts_silver name table."*
+
+---
+
+### 16.1.3 Feature Engineering — 8 Features from IBM AML Domain Knowledge
+
+All 8 features are derived from IBM AML laundering mechanics, not correlation analysis. Each targets a specific typology.
+
+| Feature | Source | Why It's an AML Signal |
 |---|---|---|
-| `amount` | raw | Criminals maximise per-theft. Large amounts disproportionately appear in fraud. |
-| `balance_gap` | `oldbalanceOrg - amount - newbalanceOrig` | The core accounting discrepancy. Money that "vanished" in transit. In legitimate TRANSFER, this should be ≈0. In fraud, it's exactly equal to the transaction amount. |
-| `gap_ratio` | `balance_gap / amount.clip(lower=1)` | Normalises the gap relative to transaction size. A ratio of 1.0 means 100% of the amount is unaccounted for — the strongest single fraud signal. clip(lower=1) prevents division by zero on zero-amount rows. |
-| `dest_drain` | `newbalanceDest - oldbalanceDest` | How much the destination grew. In PaySim fraud, criminals immediately move funds out — destination stays at 0 even after receiving large transfers. |
-| `is_transfer` | `1 if type == "TRANSFER" else 0` | TRANSFER has ~0.76% fraud rate vs. CASH_OUT ~0.0001%. Domain-encoded as binary to give the model a type-aware signal without one-hot encoding overhead. |
+| `amount` | `amount_paid` | Raw transaction size. Large amounts = integration-phase risk. |
+| `log_amount` | `log1p(amount_paid)` | Log-transforms right-skewed distribution ($0–$92M). Prevents Isolation Forest from over-fixating on extreme outliers; makes mid-range anomalies visible. |
+| `is_cross_currency` | derived in Silver | Paying currency ≠ receiving currency = primary layering signal. Obscures money trail via conversion. |
+| `is_high_value_wire` | derived in Silver | Wire Transfer >$100K = integration-phase capital movement. Large, fast, cross-border. |
+| `is_wire` | `payment_format == "Wire Transfer"` | Binary flag. Wire Transfer has the highest laundering rate in the IBM AML dataset. |
+| `is_ach` | `payment_format == "ACH"` | Binary flag. ACH is the primary structuring/smurfing format — multiple small batched payments. |
+| `amount_x_cross_ccy` | `amount × is_cross_currency` | Interaction feature: large cross-currency transfers are disproportionately risky. Captures the combined layering + size signal that neither feature alone represents. |
+| `bank_pair_launder_rate` | `cross_bank_flow` Gold table | Historical laundering rate for this exact from_bank → to_bank corridor. Injects network-level intelligence: some bank routes are systematically used for laundering regardless of individual transaction features. |
 
-**Key implementation detail:** `df["amount"].clip(lower=1)` prevents `ZeroDivisionError` in gap_ratio computation for zero-amount rows while preserving semantic meaning (a $0 transaction with a balance gap is undefined → clamped to 1 for ratio purposes).
+**Why `log_amount` over raw `amount`:**
+```python
+# Raw amount: $0 – $92,000,000 range
+# After StandardScaler: still skewed — a $92M outlier has z-score ~200
+# log1p(amount): compresses to 0 – 18.3 range, outliers have z-score ~4
+# Result: Isolation Forest now "sees" mid-range anomalies that raw amount hides
+df["log_amount"] = np.log1p(df["amount"])
+```
+
+**Why the interaction feature `amount_x_cross_ccy`:**
+```python
+# Neither feature alone captures the combined risk:
+#   - Large amount + same currency = normal institutional transfer
+#   - Small amount + cross-currency = minor FX transaction
+#   - Large amount + cross-currency = layering signal (amount × 1 = amount; otherwise 0)
+df["amount_x_cross_ccy"] = df["amount"] * df["is_cross_currency"]
+```
 
 ---
 
@@ -1013,13 +1252,16 @@ X_scaled = scaler.fit_transform(X)
 Feature value ranges before scaling:
 | Feature | Typical range | Without scaling |
 |---|---|---|
-| `amount` | $0 – $92,000,000 | Dominates all others |
-| `balance_gap` | $0 – $92,000,000 | Also large |
-| `gap_ratio` | 0.0 – 1.0+ | Ignored |
-| `dest_drain` | -$92M – $92M | Ignored |
-| `is_transfer` | 0 or 1 | Completely ignored |
+| `amount` | $0 – $92,000,000+ | Completely dominates — tree always splits on amount |
+| `log_amount` | 0 – 18.3 | Still large without scaling |
+| `is_cross_currency` | 0 or 1 | Completely ignored |
+| `is_high_value_wire` | 0 or 1 | Completely ignored |
+| `is_wire` | 0 or 1 | Completely ignored |
+| `is_ach` | 0 or 1 | Completely ignored |
+| `amount_x_cross_ccy` | 0 – $92,000,000+ | Dominated by amount |
+| `bank_pair_launder_rate` | 0 – ~5% | Swamped by amount |
 
-After `StandardScaler`: all features have mean=0, std=1. Isolation Forest's random split selection now allocates equal "attention" to each feature. `is_transfer` (0 or 1) and `amount` ($millions) have equal influence on tree splits.
+After `StandardScaler`: all 8 features have mean=0, std=1. Isolation Forest's random split selection allocates equal "attention" to each. The bank corridor rate (0–5%) and binary flags (0 or 1) have equal influence on tree splits as raw transaction amounts in the millions.
 
 ---
 
@@ -1068,122 +1310,100 @@ Domain-calibrated contamination = 0.013
 
 ---
 
-### 16.1.6 Domain Rules Engine — Defense in Depth
+### 16.1.6 Domain Rules Engine — 3-Rule Defense in Depth
 
 ```python
-# Thresholds derived empirically from the Gold layer sample
-amount_75th = df["amount"].quantile(0.75)
-gap_75th    = df["balance_gap"].quantile(0.75)
-ratio_75th  = df["gap_ratio"].quantile(0.75)
+avg_amt = df["amount"].mean()
 
-# Rule: flag if 2 out of 3 conditions are met (majority vote, not strict AND)
-cond1 = (df["amount"]      >= amount_75th).astype(int)  # large transaction
-cond2 = (df["balance_gap"] >= gap_75th).astype(int)     # large discrepancy
-cond3 = (df["gap_ratio"]   >= ratio_75th).astype(int)   # high proportion unaccounted
+# Rule 1: Integration — high-value wire transfer
+rule1 = (df["amount"] > 100_000) & (df["is_high_value_wire"] == 1)
 
-df["rule_flag"] = ((cond1 + cond2 + cond3) >= 2).astype(int)
+# Rule 2: Layering — cross-currency + above-dataset-average amount
+rule2 = (df["is_cross_currency"] == 1) & (df["amount"] > avg_amt)
+
+# Rule 3: Hot corridor — bank pair with >0.5% historical laundering rate
+#         Sourced from cross_bank_flow Gold table — network-level intelligence
+rule3 = df["bank_pair_launder_rate"] > 0.5
+
+df["rule_flag"]  = (rule1 | rule2 | rule3).astype(int)
+df["rule1_flag"] = rule1.astype(int)   # saved individually for UI breakdown
+df["rule2_flag"] = rule2.astype(int)
+df["rule3_flag"] = rule3.astype(int)
 ```
 
-**Why 2-of-3 and not strict AND (all 3)?**  
-Strict AND would miss transactions that are large AND have high gap_ratio but sit just below the gap absolute threshold. A TRANSFER of $50,000 with gap_ratio = 0.99 is almost certainly fraud even if balance_gap is at the 73rd percentile. 2-of-3 is more robust to edge cases at threshold boundaries.
+**Why three rules:**
 
-**Tier assignment logic:**
+| Rule | Typology Targeted | Signal Source |
+|---|---|---|
+| Rule 1: HVW >$100K | Integration phase | Transaction amount + format |
+| Rule 2: Cross-ccy + above-avg | Layering | Currency pair + relative amount |
+| Rule 3: Hot bank corridor | Systemic routing | Network-level Gold table |
+
+Rule 3 is the smart addition: it injects knowledge from `cross_bank_flow` (which aggregates 5M rows into bank-pair laundering rates at dbt build time). A transaction can look individually normal but route through a corridor historically used for 2%+ of laundering. Without Rule 3, this pattern is invisible to per-row ML.
+
+**Tier assignment:**
 ```python
-# HIGH:   Isolation Forest flagged it AND domain rules flagged it
-#         → Both independent systems agree → strongest signal
-# MEDIUM: One of the two systems flagged it
-#         → Worth human investigation but not a conviction
-# LOW:    Neither system raised a flag — normal transaction
+# HIGH:   Isolation Forest flagged AND any rule fired → two independent systems agree
+# MEDIUM: Either Isolation Forest OR any rule → investigate further
+# LOW:    Neither raised a flag
 ```
+
+**Interview point:** *"Rule 3 is the key insight. I moved laundering network knowledge from aggregate SQL into individual transaction scoring. cross_bank_flow pre-computes bank-pair rates at Gold layer build time, so Agent 1 joins in historical corridor intelligence without re-scanning 5M rows at inference time."*
 
 ---
 
-### 16.1.7 Live Run Results (Verified from Screenshot)
+### 16.1.7 Gold Layer Dashboard — Live from Databricks
 
-**Gold Layer Dashboard (pre-run, from Databricks):**
+**Key metrics (from Gold `fraud_rate_by_type` and `high_risk_accounts`):**
 | Metric | Value |
 |---|---|
-| Total Transactions | 6.36M |
-| Confirmed Fraud | 8.1K |
-| Fraud Rate | 0.1288% |
-| Contamination Param | 0.013 |
+| Total Transactions | 5.07M (IBM AML dataset) |
+| Confirmed Laundering | from is_laundering label |
+| Contamination Param | 0.013 (domain-calibrated) |
 
-**Fraud by Transaction Type (Gold `fraud_rate_by_type`):**
-| Type | Total | Fraud Count | Rate | Tier |
-|---|---|---|---|---|
-| PAYMENT | ~1,021,000 | 4 | ~0.0004% | 🟢 CLEAR |
-| TRANSFER | ~531,000 | **4,071** | **~0.76%** | 🔴 HIGH |
-| CASH_OUT | ~2,800,000 | 4 | ~0.0001% | 🟡 LOW |
-| DEBIT | ~41,000 | 3 | ~0.007% | 🟡 LOW |
-| CASH_IN | ~1,300,000 | 0 | 0% | 🟢 CLEAR |
+**Laundering by Payment Format (Gold `fraud_rate_by_type`):**
+| Format | Key Characteristic |
+|---|---|
+| Wire Transfer | Highest laundering rate — used in integration phase |
+| ACH | Moderate — batch processing, structuring risk |
+| Cheque | Lower — slower, paper trail |
+| Credit Card | Low — real-time controls |
+| Debit Card | Low — real-time controls |
 
 **Detection Engine Results (contamination=0.013, ALL types):**
 | Metric | Live Value |
 |---|---|
 | Transactions Sampled | **58,026** |
-| HIGH Risk | **25** |
-| MEDIUM Risk | **9,065** |
-| LOW (Normal) | **40,190** |
-| Confirmed Fraud in Sample | **28** |
+| HIGH Risk | Both Isolation Forest AND domain rules agree |
+| MEDIUM Risk | One of the two systems flagged |
+| LOW (Normal) | Neither system raised a flag |
 
 ---
 
 ### 16.1.8 Plotly Scatter Plot — Technical Design Decisions
 
 **Layout rationale:**
-- X = `amount`: Fraud involves large transactions → rightward cluster
-- Y = `balance_gap`: Money that vanished → upward cluster  
-- Together: fraud should cluster top-right — the HIGH RISK ZONE
-
-**HIGH RISK ZONE annotation:**
-```python
-# The rectangle is drawn at exactly the same thresholds as apply_rules()
-# This visually confirms ML cluster and rule thresholds are co-located
-fig.add_shape(
-    type="rect",
-    x0=df["amount"].quantile(0.75),
-    x1=df["amount"].max() * 1.05,
-    y0=df["balance_gap"].quantile(0.75),
-    y1=df["balance_gap"].max() * 1.05,
-    line=dict(color="rgba(248,113,113,0.35)", dash="dot"),
-    fillcolor="rgba(248,113,113,0.04)",
-)
-```
+- X = `amount` (amount_paid): High-value transactions cluster right — key structural signal
+- Y = `anomaly_score` (0–100): Higher = more unusual relative to dataset  
+- Together: the most suspicious accounts cluster top-right
 
 **Trace design for three risk tiers:**
 - LOW (grey): opacity=0.4, size=5 — dense background cluster, visually recedes
-- MEDIUM (amber): size=ML score clipped 6–16 — size tracks model confidence
-- HIGH (red): size=ML score clipped 10–20, opacity=0.9 — dominant foreground
+- MEDIUM (amber): size=8, opacity=0.75 — intermediate signal
+- HIGH (red): size=12, opacity=0.9 — dominant foreground
 
-**Hover tooltip:** Account ID (bold), Type, Amount, Balance Gap, Anomaly Score, Tier — exactly the fields needed for a compliance analyst to decide next action.
+**Hover tooltip:** Account ID (bold), Payment Format, Amount, Anomaly Score, Tier — exactly the fields needed for a compliance analyst to decide next action.
 
 ---
 
-### 16.1.9 Flagged Accounts Table — UX Engineering
+### 16.1.9 Flagged Accounts Table
 
 **Columns rendered:**
-1. `Account ID` — monospace for readability of PaySim format (e.g., `C1137538024`)
-2. `Type` — transaction type (TRANSFER or CASH_OUT)
-3. `Amount` — formatted with `$` and `,` separators
-4. `Balance Gap` — absolute unaccounted amount in dollars
-5. `Gap Ratio` — normalised score, 2 decimal places
-6. `Anomaly Score` — in-cell progress bar (0–100) + coloured numeric label
-7. `Risk Tier` — HIGH (red badge) / MEDIUM (amber badge)
-8. `Fraud Status` — CONFIRMED (red) / UNCONFIRMED (green) from ground truth
-
-**Pagination implementation:**
-- 25 rows per page
-- Sliding window of 7 page buttons centred on current page
-- `st.session_state["_hunt_page"]` persists across reruns
-- Filter key `f"{search}|{tier}"` resets to page 1 when filter changes
-
-**Anomaly Score bar (inline HTML in table cell):**
-```python
-_bar_color = "#F87171" if score >= 75 else "#FBBF24" if score >= 50 else "#4A6080"
-# Renders a CSS-animated div width proportional to score
-```
-
-**Collapsible glossary:** `<details>/<summary>` HTML element with grid layout — explains all 8 columns in plain English for non-technical compliance users. Opens on click, no JS required.
+1. `account_id` — the IBM AML account identifier
+2. `Payment_Format` — Wire Transfer / ACH / Cheque / Credit Card / Debit Card
+3. `amount` — formatted with `$` and `,` separators (amount_paid from IBM AML)
+4. `anomaly_score` — Isolation Forest score normalised to 0–100
+5. `confidence_tier` — HIGH (red) / MEDIUM (amber) — dual-flag agreement
 
 ---
 
@@ -1192,8 +1412,8 @@ _bar_color = "#F87171" if score >= 75 else "#FBBF24" if score >= 50 else "#4A608
 ```python
 # Agent 1 saves its scored records for Agent 2 to consume
 st.session_state.agent1_results = flagged[[
-    "account_id", "type", "amount", "balance_gap", "gap_ratio",
-    "dest_drain", "is_fraud",
+    "account_id", "Payment_Format", "amount",
+    "is_cross_currency", "is_high_value_wire", "is_fraud",
     "anomaly_score", "confidence_tier", "rule_flag", "ml_flag",
 ]].to_dict("records")
 ```
@@ -1205,11 +1425,109 @@ st.session_state.agent1_results = flagged[[
 
 ---
 
-## 16.2 Agent 2: INVESTIGATE (Account RAG)
-- **Model:** Gemini 2.0 Flash (250K context window).
-- **Mechanism:** Cross-references account-level transaction history from the Gold layer with market volatility data for high-fidelity auditing.
-- **Input:** `st.session_state.agent1_results` from Agent 1 — list of flagged account dicts.
-- **Status:** RAG pipeline wired; conversational interface in active development.
+## 16.2 Agent 2: INVESTIGATE (Full-Spectrum RAG)
+
+**Model:** Groq Llama 3.3 70B (fast inference, 128K context)  
+**Architecture:** Multi-source RAG — assembles context from 8 Gold tables before every LLM call  
+**Input:** `st.session_state.agent1_results` from Agent 1 + direct Databricks queries
+
+### 16.2.1 RAG Context Pipeline — 8 Gold Tables Used
+
+Every LLM call assembles a structured context block from all available Gold tables:
+
+| Context Block | Gold Table | What It Adds |
+|---|---|---|
+| Agent 1 forensic | (session state) | ML scores, 3-rule breakdown, score band, percentile |
+| Transaction history | `flagged_account_transactions` | Per-row bank routing, currency pairs, amounts, timestamps |
+| Bank corridor risk | `cross_bank_flow` | Historical laundering rate for this specific bank pair |
+| Entity profile | `entity_laundering_profile` | Entity-type laundering rate, bank network size |
+| Peer ranking | `investigation_queue` | Where this account ranks vs top 25 by exposure |
+| Hourly pattern | `hourly_pattern_analysis` | Which hours see peak laundering — off-hours flagging |
+| Payment format rates | `fraud_rate_by_type` | Dataset-wide laundering rate per format |
+| Market correlation | `transaction_market_context` + `stocks_performance_ranking` | laundering_intensity_vs_10d_avg, is_market_stress_day |
+
+**Why this multi-table approach vs. one big query:**  
+Each table is pre-aggregated at dbt build time at the right granularity. `cross_bank_flow` aggregates 5M rows into bank-pair summaries. `hourly_pattern_analysis` aggregates by hour. Querying each table separately at inference time is fast (pre-computed) and keeps the RAG context structured — the LLM gets labelled sections, not a raw data dump.
+
+### 16.2.2 Off-Hours Detection (New Signal)
+
+```python
+ts = pd.to_datetime(df["transaction_timestamp"], errors="coerce")
+off_hours_count = int(((ts.dt.hour < 9) | (ts.dt.hour >= 17)).sum())
+```
+
+Off-hours transactions (outside 09:00–17:00) are a structuring/smurfing temporal signal. The LLM is given `off_hours_txns={count}/{total}` in the context block and cross-references against `hourly_pattern_analysis` to determine if these hours correspond to known high-laundering windows.
+
+### 16.2.3 Entity-Type Context
+
+```python
+entity_type = {0: "Corporation", 1: "Partnership", 2: "Sole Proprietorship"}.get(enc, "Unknown")
+```
+
+The `entity_laundering_profile` Gold table (joins `transactions_silver` with `accounts_silver`) gives per-entity-type laundering rates. If a Sole Proprietorship shows Corporation-scale wire transfers, that is a red flag the LLM is explicitly directed to name.
+
+### 16.2.4 Laundering-Market Correlation Context
+
+`transaction_market_context` Gold table pre-computes daily:
+- `laundering_intensity_vs_10d_avg`: ratio of today's laundering count vs 10-day rolling average
+- `is_market_stress_day`: TRUE when both JPM and GS daily returns are negative
+
+The LLM receives 10 recent days of this data and can reason: *"laundering_intensity = 1.8x on a market stress day suggests coordinated capital flight using the banking sector downturn as cover."*
+
+### 16.2.5 Context Routing Logic
+
+```python
+def route_context(question, account_id, agent1_results, all_scores):
+    parts = [
+        _agent1_forensic_str(account_id, agent1_results, all_scores),  # always
+        _account_context_str(account_id),   # bank routing, off-hours, entity
+        _peer_context_str(account_id),       # peer ranking with entity+bank names
+        _hourly_pattern_str(account_id),     # off-hours vs peak laundering hours
+        _fraud_rate_str(),                   # dataset-wide rates by format
+        _market_str(),                       # stocks + market-stress correlation
+    ]
+    return "─"*72.join(parts)
+```
+
+The LLM receives all blocks for every question. The system prompt instructs it to answer the specific question asked — not repeat earlier blocks. Prior Q&A is injected as real conversation history (last 6 turns) so the model cannot claim ignorance of facts it already stated.
+ 
+### 16.2.6 Suggestion Chips — Dynamically Driven by Agent 1 Signals
+
+Suggestion chips are generated from `agent1_results` for the selected account:
+- If `cross_ccy > 0` → layering typology chip
+- If `high_wire > 0` → integration-phase chip  
+- If `both_flags > 0` → dual-system agreement chip
+- If `rule3_flag > 0` (hot corridor) → bank routing chip (surfaces `bank_pair_launder_rate`)
+- Always: off-hours/timing chip, peer comparison chip
+
+Each chip passes a pre-filled question that includes exact account-specific numbers (cross-currency count, wire count, bank corridor rate), so the LLM gets a precise prompt, not a generic one.
+
+### 16.2.7 The Logic Loop: From Question to Forensic Insight
+
+The Agent 2 backend follows a rigorous **Augmented Forensic Loop** that ensures every AI response is grounded in hard evidence from the Databricks Gold layer:
+
+1.  **Request Trigger**: When a user selects a question or types a prompt, the system captures the `selected_account` and current `chat_history` from `st.session_state`.
+2.  **Multi-Dimensional Retrieval (The "Querying" Phase)**:
+    *   Instead of one massive, slow joined query, the system executes **8 parallel specialized queries** against the Gold layer (fetching transaction forensics, peer ranking, bank corridor risk, etc.).
+    *   This is done via `route_context()`, which uses `@st.cache_data` to ensure that subsequent questions for the same account have **sub-10ms context retrieval**.
+3.  **Augmentation (Context Inlining)**:
+    *   The raw results are transformed into a **High-Density Data String**. This includes formatting transaction rows into monospaced tables and citing exact percentages for laundering rates.
+    *   This string is injected into the `=== TRANSACTION EVIDENCE ===` block of the user message.
+4.  **Prompt Construction**:
+    *   The `_build_messages()` function assembles the `_SYSTEM_PROMPT` (the "Investigator Persona"), the conversation history (to maintain context), and the newly augmented evidence block.
+    *   **Crucial Logic**: The system prompt contains **Typology Definitions** (Layering, Integration, etc.). The LLM's job is to "overlay" these definitions onto the retrieved data to find matches.
+5.  **Inference (Insights Generation)**:
+    *   The prompt is sent to **Groq (Llama 3.3 70B)**. 
+    *   Because the data is already pre-aggregated and structured into clear "indicators" (e.g., `off_hours_txns=4/10`), the LLM doesn't have to "calculate" — it only has to **Reason**.
+    *   **Result**: A forensic answer that cites specific banks, dates, and amounts, concluding with a domain-specific insight (e.g., *"This matches the Layering typology due to the USD-to-EUR conversion through Bank 802."*)
+
+---
+
+## 16.2.8 Agent 2 Layout & Forensic UI (Production Grade)
+
+*   **Native Containerization**: To avoid the common Streamlit 'empty space' and height recalculation bugs, Agent 2 uses native styled `st.container` and `st.markdown` instead of potentially brittle IFrames.
+*   **Icon-Based Forensic Table**: Transaction rows use visual icons (⚠️, ⏫, 🚩) for high-value scale and laundering confirms, reducing visual clutter while maintaining high information density.
+*   **Action Tiles**: Suggestion leads are presented as a grid of interactive cards with distinct titles and tactical subtitles, improving the UX for non-technical compliance analysts.
 
 ## 16.3 Agent 3: REASON (Regulatory Classification)
 - **Model:** DeepSeek R1 (Chain-of-Thought via OpenRouter).

@@ -2,11 +2,13 @@ version: 2
 
 sources:
   - name: finpulse
-    description: "Silver layer tables pushed from local processing"
-    database: workspace
+    description: "Silver layer tables for IBM AML and Market intelligence"
+    database: workspace # Updated from hive_metastore to follow Unity Catalog requirements
     schema: finpulse
     tables:
       - name: transactions_silver
-        description: "Standardized financial transactions data (Paysim)"
-      - name: stocks_silver
+        description: "Standardized financial transactions (IBM AML schema)"
+      - name: accounts_silver
+        description: "Entity and account ownership mapping (IBM AML)"
+      - name: silver_stocks
         description: "Standardized stock market historical data (Yahoo Finance)"

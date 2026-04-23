@@ -12,17 +12,84 @@ models:
           - not_null
 
   - name: daily_transaction_summary
-    description: "Daily summary of transactions"
+    description: "Daily summary of transactions with laundering metrics"
+    tests:
+      - elementary.volume_anomalies:
+          description: "Monitor daily ingestion volume for unexpected drops"
     columns:
       - name: transaction_date
         tests:
           - not_null
-      - name: total_amount
+      - name: laundering_count
         tests:
           - not_null
 
-  - name: balance_discrepancy_summary
+  - name: aml_risk_indicators
+    description: "Aggregation of high-level risk metrics per account"
     columns:
+      - name: account_id
+        tests:
+          - not_null
+      - name: risk_indicator_count
+        tests:
+          - not_null
+
+  - name: investigation_queue
+    description: >
+      Definitive ranked list of all accounts that warrant investigation based on IBM AML indicators.
+      Priority scoring calculated based on confirmed laundering and multi-risk indicators.
+    columns:
+      - name: account_id
+        tests:
+          - not_null
+          - unique
+      - name: priority_score
+        tests:
+          - not_null
+          - elementary.column_anomalies:
+              description: "Detect drifts in account risk scoring"
+
+  - name: flagged_account_transactions
+    description: >
+      Full transaction history for accounts flagged with IBM AML risk indicators. 
+      Includes cross-currency and high-value wire flags.
+    columns:
+      - name: account_id
+        tests:
+          - not_null
       - name: amount
         tests:
           - not_null
+      - name: payment_format
+        tests:
+          - not_null
+
+  - name: transaction_market_context
+    description: "Correlation between transaction laundering rates and banking sector stocks (JPM, GS)."
+    columns:
+      - name: transaction_date
+        tests:
+          - not_null
+      - name: laundering_intensity_vs_10d_avg
+        tests:
+          - not_null
+
+  - name: entity_laundering_profile
+    description: "Laundering rates and transaction volume segmented by account entity types."
+    columns:
+      - name: entity_name
+        tests:
+          - not_null
+      - name: laundering_rate_pct
+        tests:
+          - not_null
+
+  - name: cross_bank_flow
+    description: "Heatmap of transaction and laundering volumes between sender and receiver banks."
+    columns:
+       - name: from_bank
+         tests:
+           - not_null
+       - name: to_bank
+         tests:
+           - not_null

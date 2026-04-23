@@ -1,0 +1,882 @@
+"""
+FinPulse — Agent 3: RISK ASSESSMENT & REGULATORY DECISION ENGINE
+=================================================================
+Fundamental difference from Agent 2:
+
+  Agent 2  →  MICRO:  "What happened with this one account?" (investigation)
+  Agent 3  →  MACRO:  "What does it mean systemically?" (risk + regulatory decision)
+
+Key design principles:
+  1. DeepSeek R1 via OpenRouter — chain-of-thought reasoning model (not Groq)
+     The thinking process is SHOWN, not hidden. This IS the regulatory audit trail.
+  2. Takes Agent 2 investigation context as INPUT — builds on it, does not repeat it
+  3. Operates across ALL flagged accounts — not one at a time
+  4. Produces formal regulatory outputs:
+       - Structured risk classification (CRITICAL / HIGH / MEDIUM / LOW) with evidence matrix
+       - SAR (Suspicious Activity Report) recommendation
+       - AML typology confirmation with supporting data
+       - Market-laundering correlation assessment (IBM AML unique capability)
+  5. Visible reasoning chain — users see DeepSeek THINK before it concludes
+  6. Two modes: auto-run on Agent 2 handoff, or standalone batch assessment
+"""
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import os
+import sys
+import time
+import json
+import re
+from pathlib import Path
+from datetime import datetime
+
+_PROJECT_ROOT = Path(__file__).parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DEEPSEEK R1 CLIENT  (via OpenRouter — chain-of-thought reasoning model)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _get_deepseek_client():
+    """
+    DeepSeek R1 via OpenRouter.
+    R1 is a reasoning model — it produces a visible <think>...</think> block
+    before its final answer. This thinking chain is the regulatory audit trail.
+    """
+    if "deepseek_client" not in st.session_state:
+        import dotenv
+        from openai import OpenAI
+        dotenv.load_dotenv(r"C:\FinPulse Project\.env")
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        if not api_key:
+            raise ValueError("OPENROUTER_API_KEY not found in .env")
+        st.session_state.deepseek_client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=api_key,
+        )
+    return st.session_state.deepseek_client
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DATABRICKS QUERY HELPER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _query(sql: str) -> pd.DataFrame:
+    from config import DATABRICKS_HOST, DATABRICKS_HTTP_PATH, DATABRICKS_TOKEN
+    from databricks import sql as dbsql
+    conn = dbsql.connect(
+        server_hostname=DATABRICKS_HOST,
+        http_path=DATABRICKS_HTTP_PATH,
+        access_token=DATABRICKS_TOKEN,
+    )
+    try:
+        cur = conn.cursor()
+        cur.execute(sql)
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+        return pd.DataFrame(rows, columns=cols)
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GOLD LAYER DATA RETRIEVAL
+# These are DIFFERENT queries from Agent 2 — systemic/portfolio level, not per-account
+# ══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_systemic_risk_summary() -> pd.DataFrame:
+    """
+    Portfolio-level risk summary across ALL flagged accounts.
+    Agent 2 looked at one account. Agent 3 looks at ALL of them together.
+    """
+    from config import DATABRICKS_SCHEMA
+    return _query(f"""
+        SELECT
+            COUNT(*)                                    AS total_flagged_accounts,
+            SUM(CASE WHEN is_laundering = 1
+                THEN 1 ELSE 0 END)                      AS confirmed_laundering_accounts,
+            SUM(CASE WHEN flag_confirmed_fraud = 1
+                THEN 1 ELSE 0 END)                      AS sar_eligible_accounts,
+            SUM(CASE WHEN flag_multi_risk = 1
+                THEN 1 ELSE 0 END)                      AS multi_indicator_accounts,
+            ROUND(AVG(priority_score), 2)               AS avg_priority_score,
+            ROUND(MAX(priority_score), 2)               AS max_priority_score,
+            SUM(total_amount)                           AS total_exposure_usd,
+            SUM(cross_currency_count)                   AS total_cross_currency_txns,
+            SUM(high_value_wire_count)                  AS total_high_value_wires
+        FROM {DATABRICKS_SCHEMA}.investigation_queue
+    """)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_typology_breakdown() -> pd.DataFrame:
+    """
+    AML typology distribution from fraud_rate_by_type.
+    Agent 3 uses this to formally confirm typology in the risk classification.
+    """
+    from config import DATABRICKS_SCHEMA
+    return _query(f"""
+        SELECT
+            payment_format,
+            total_transactions,
+            laundering_count,
+            laundering_rate_pct,
+            CASE
+                WHEN payment_format = 'Wire Transfer' THEN 'Integration'
+                WHEN payment_format = 'ACH'           THEN 'Layering'
+                WHEN payment_format = 'Cheque'        THEN 'Structuring'
+                WHEN payment_format = 'Reinvestment'  THEN 'Layering'
+                WHEN payment_format = 'Credit Card'   THEN 'Placement'
+                ELSE 'Unknown'
+            END                                         AS aml_typology
+        FROM {DATABRICKS_SCHEMA}.fraud_rate_by_type
+        ORDER BY laundering_rate_pct DESC
+    """)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_market_stress_correlation() -> pd.DataFrame:
+    """
+    The crown jewel — laundering intensity vs market stress correlation.
+    UNIQUE to IBM AML dataset. Does laundering spike during banking sector stress?
+    """
+    from config import DATABRICKS_SCHEMA
+    return _query(f"""
+        SELECT
+            transaction_date,
+            total_transactions,
+            total_volume_usd,
+            laundering_count,
+            laundering_rate_pct,
+            cross_currency_count,
+            high_value_wire_count,
+            jpm_close,
+            jpm_daily_return_pct,
+            gs_close,
+            gs_daily_return_pct,
+            is_market_stress_day,
+            laundering_intensity_vs_10d_avg
+        FROM {DATABRICKS_SCHEMA}.transaction_market_context
+        ORDER BY transaction_date ASC
+    """)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_entity_risk_distribution() -> pd.DataFrame:
+    """Entity type risk — Corporation vs Partnership vs Sole Proprietorship."""
+    from config import DATABRICKS_SCHEMA
+    try:
+        return _query(f"""
+            SELECT
+                entity_type_encoded,
+                COUNT(*)                            AS entity_count,
+                SUM(laundering_count)               AS total_laundering,
+                ROUND(AVG(laundering_rate_pct), 4)  AS avg_laundering_rate,
+                SUM(total_volume_usd)               AS total_volume,
+                ROUND(AVG(banks_involved), 2)       AS avg_banks_involved
+            FROM {DATABRICKS_SCHEMA}.entity_laundering_profile
+            GROUP BY entity_type_encoded
+            ORDER BY avg_laundering_rate DESC
+        """)
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_hottest_corridors() -> pd.DataFrame:
+    """Top 10 most dangerous bank-to-bank corridors. IBM AML unique capability."""
+    from config import DATABRICKS_SCHEMA
+    try:
+        return _query(f"""
+            SELECT
+                from_bank, to_bank,
+                transaction_count,
+                total_volume_usd,
+                laundering_count,
+                laundering_rate_pct,
+                cross_currency_count
+            FROM {DATABRICKS_SCHEMA}.cross_bank_flow
+            WHERE transaction_count > 500
+            ORDER BY laundering_rate_pct DESC
+            LIMIT 10
+        """)
+    except Exception:
+        return pd.DataFrame()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ASSESSMENT CONTEXT BUILDER
+# Completely different from Agent 2's route_context()
+# Agent 2: per-account transaction evidence
+# Agent 3: systemic patterns, regulatory framework, market correlation
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_assessment_context(
+    agent2_context: dict,
+    systemic_df: pd.DataFrame,
+    typology_df: pd.DataFrame,
+    market_df: pd.DataFrame,
+    entity_df: pd.DataFrame,
+    corridors_df: pd.DataFrame,
+) -> str:
+    lines = []
+
+    # Section 1: Agent 2 Handoff
+    lines.append("=" * 72)
+    lines.append("SECTION 1: AGENT 2 INVESTIGATION FINDINGS (handoff from investigator)")
+    lines.append("=" * 72)
+    if agent2_context:
+        acct = agent2_context.get("selected_account", "Unknown")
+        lines.append(f"Primary account investigated: {acct}")
+        lines.append(f"Total flagged accounts: {agent2_context.get('flagged_count', 'N/A')}")
+        lines.append(f"\nAgent 1 detection summary:\n{agent2_context.get('agent1_summary', 'Not available')}")
+        lines.append("\nInvestigator conversation (last 3 turns):")
+        for turn in agent2_context.get("full_history", [])[-3:]:
+            lines.append(f"  Q: {turn['question']}")
+            lines.append(f"  A: {turn['answer'][:300]}...")
+    else:
+        lines.append("No Agent 2 context. Running standalone batch assessment.")
+
+    # Section 2: Portfolio Risk
+    lines.append("\n" + "=" * 72)
+    lines.append("SECTION 2: PORTFOLIO RISK EXPOSURE")
+    lines.append("=" * 72)
+    if not systemic_df.empty:
+        r = systemic_df.iloc[0]
+        total_flagged  = int(r.get("total_flagged_accounts", 0))
+        confirmed      = int(r.get("confirmed_laundering_accounts", 0))
+        sar_eligible   = int(r.get("sar_eligible_accounts", 0))
+        multi          = int(r.get("multi_indicator_accounts", 0))
+        exposure       = float(r.get("total_exposure_usd", 0))
+        avg_score      = float(r.get("avg_priority_score", 0))
+        max_score      = float(r.get("max_priority_score", 0))
+        total_cc       = int(r.get("total_cross_currency_txns", 0))
+        total_hvw      = int(r.get("total_high_value_wires", 0))
+        lines.append(f"Total flagged accounts     : {total_flagged:,}")
+        lines.append(f"Confirmed laundering       : {confirmed:,}")
+        lines.append(f"SAR-eligible accounts      : {sar_eligible:,}")
+        lines.append(f"Multi-indicator accounts   : {multi:,}")
+        lines.append(f"Total exposure             : ${exposure:,.0f} USD")
+        lines.append(f"Priority score avg / max   : {avg_score:.1f} / {max_score:.1f}")
+        lines.append(f"Cross-currency transactions: {total_cc:,}")
+        lines.append(f"High-value wire transfers  : {total_hvw:,}")
+        if total_flagged > 0:
+            lines.append(f"Confirmation rate          : {confirmed/total_flagged*100:.1f}%")
+            lines.append(f"SAR eligibility rate       : {sar_eligible/total_flagged*100:.1f}%")
+
+    # Section 3: AML Typology
+    lines.append("\n" + "=" * 72)
+    lines.append("SECTION 3: AML TYPOLOGY CONFIRMATION")
+    lines.append("=" * 72)
+    if not typology_df.empty:
+        for _, r in typology_df.iterrows():
+            lines.append(
+                f"  {str(r.get('payment_format','?')):16s} | "
+                f"typology={str(r.get('aml_typology','?')):12s} | "
+                f"txns={int(r.get('total_transactions',0)):>8,} | "
+                f"laundering={int(r.get('laundering_count',0)):>6,} | "
+                f"rate={float(r.get('laundering_rate_pct',0)):.4f}%"
+            )
+
+    # Section 4: Market-Laundering Correlation
+    lines.append("\n" + "=" * 72)
+    lines.append("SECTION 4: MARKET STRESS CORRELATION (IBM AML unique capability)")
+    lines.append("=" * 72)
+    if not market_df.empty:
+        stress    = market_df[market_df["is_market_stress_day"] == True]
+        non_stress = market_df[market_df["is_market_stress_day"] == False]
+        avg_i_s  = float(stress["laundering_intensity_vs_10d_avg"].mean()) if not stress.empty else 0
+        avg_i_ns = float(non_stress["laundering_intensity_vs_10d_avg"].mean()) if not non_stress.empty else 0
+        avg_l_s  = float(stress["laundering_count"].mean()) if not stress.empty else 0
+        avg_l_ns = float(non_stress["laundering_count"].mean()) if not non_stress.empty else 0
+        lines.append(f"  Stress days (JPM & GS both negative): {len(stress)}/{len(market_df)}")
+        lines.append(f"  Avg laundering intensity — stress days   : {avg_i_s:.3f}x")
+        lines.append(f"  Avg laundering intensity — calm days     : {avg_i_ns:.3f}x")
+        lines.append(f"  Avg laundering count    — stress days    : {avg_l_s:.1f}")
+        lines.append(f"  Avg laundering count    — calm days      : {avg_l_ns:.1f}")
+        if avg_i_s > avg_i_ns and avg_i_ns > 0:
+            uplift = ((avg_i_s / avg_i_ns) - 1) * 100
+            lines.append(f"  Laundering uplift on stress days         : +{uplift:.1f}%")
+        lines.append("\n  Day-by-day:")
+        for _, r in market_df.iterrows():
+            flag = " *** STRESS ***" if r.get("is_market_stress_day") else ""
+            lines.append(
+                f"    {r.get('transaction_date','?')} | "
+                f"launder={int(r.get('laundering_count',0)):>4} | "
+                f"intensity={float(r.get('laundering_intensity_vs_10d_avg',0)):.2f}x | "
+                f"jpm={float(r.get('jpm_daily_return_pct',0)):+.2f}% | "
+                f"gs={float(r.get('gs_daily_return_pct',0)):+.2f}%{flag}"
+            )
+
+    # Section 5: Entity Risk
+    lines.append("\n" + "=" * 72)
+    lines.append("SECTION 5: ENTITY TYPE RISK DISTRIBUTION")
+    lines.append("=" * 72)
+    if not entity_df.empty:
+        type_map = {0: "Corporation", 1: "Partnership", 2: "Sole Proprietorship", -1: "Unknown"}
+        for _, r in entity_df.iterrows():
+            enc = int(r.get("entity_type_encoded", -1))
+            lines.append(
+                f"  {type_map.get(enc,'Unknown'):22s} | "
+                f"entities={int(r.get('entity_count',0)):>6,} | "
+                f"avg_rate={float(r.get('avg_laundering_rate',0)):.4f}% | "
+                f"avg_banks={float(r.get('avg_banks_involved',0)):.1f} | "
+                f"vol=${float(r.get('total_volume',0)):>14,.0f}"
+            )
+
+    # Section 6: Hot Corridors
+    lines.append("\n" + "=" * 72)
+    lines.append("SECTION 6: HIGH-RISK BANK CORRIDORS (cross-institutional view)")
+    lines.append("=" * 72)
+    if not corridors_df.empty:
+        for i, (_, r) in enumerate(corridors_df.iterrows(), 1):
+            lines.append(
+                f"  #{i:02d} Bank {int(r.get('from_bank',0)):>6} → "
+                f"Bank {int(r.get('to_bank',0)):>6} | "
+                f"rate={float(r.get('laundering_rate_pct',0)):.4f}% | "
+                f"txns={int(r.get('transaction_count',0)):>6,} | "
+                f"vol=${float(r.get('total_volume_usd',0)):>12,.0f}"
+            )
+    else:
+        lines.append("  Hot corridor data unavailable.")
+
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DEEPSEEK R1 SYSTEM PROMPT
+# ══════════════════════════════════════════════════════════════════════════════
+
+_SYSTEM_PROMPT = """You are a Chief Risk Officer at a global financial institution running the FinPulse AML Intelligence Platform.
+
+Your role is NOT to investigate individual accounts — that was Agent 2's job.
+Your role is to produce a formal, regulatory-grade RISK ASSESSMENT REPORT based on systemic evidence.
+
+DATASET: IBM AML HI-Small_Trans.csv — 5,078,316 synthetic transactions, Sep 1-10 2022.
+Complete cross-institutional view: sender bank, receiver bank, payment format, currency flow.
+September 2022 was volatile for US banking stocks — JPM and GS experienced several negative days.
+This is the unique capability of IBM AML data: full cross-bank visibility unavailable with real data.
+
+YOUR DELIVERABLE — A FORMAL RISK ASSESSMENT with these exact sections:
+
+SECTION 1 — RISK CLASSIFICATION MATRIX
+  Overall risk level: CRITICAL / HIGH / MEDIUM / LOW
+  Evidence matrix with scores (0-10) for each dimension:
+    - Transaction Volume Risk     : volume and frequency of suspicious activity
+    - Typology Severity           : which typologies confirmed (layering > structuring > placement)
+    - Network Complexity Risk     : number of banks, cross-currency chains
+    - Entity Profile Risk         : which entity types are dominant
+    - Market Correlation Risk     : does laundering spike during market stress?
+    - Regulatory Exposure Risk    : how many accounts meet SAR threshold?
+
+SECTION 2 — AML TYPOLOGY CONFIRMATION
+  For each confirmed typology:
+    - Typology name
+    - Payment formats involved and their laundering rates
+    - Regulatory significance under BSA/AML
+
+SECTION 3 — MARKET-LAUNDERING CORRELATION FINDING
+  State clearly whether laundering is elevated during banking sector stress.
+  Cite the exact intensity uplift percentage.
+  State what this implies about actor intent: opportunistic vs systematic.
+
+SECTION 4 — SYSTEMIC NETWORK ASSESSMENT
+  Hot corridors, entity concentrations, cross-currency chains.
+  Which bank pairs are the highest-risk routing nodes?
+
+SECTION 5 — REGULATORY RECOMMENDATIONS
+  For each recommendation:
+    - Action: SAR_FILING / ACCOUNT_FREEZE / ENHANCED_MONITORING / ESCALATE_TO_FIU
+    - Urgency: IMMEDIATE / 24H / 72H / ROUTINE
+    - Justification with exact numbers
+    - Regulatory framework: BSA/AML, FinCEN, FATF
+
+RULES:
+1. Show reasoning step by step. The chain-of-thought IS the audit trail.
+2. Cite EXACT numbers. Never use approximations.
+3. Be declarative. Regulators need clear conclusions, not hedged language.
+4. Do not repeat Agent 2 account investigation — build on it with systemic analysis.
+5. The MARKET CORRELATION FINDING is your most unique insight — give it proper weight.
+6. If evidence is insufficient for a conclusion, state what additional data is needed.
+"""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PARSE DEEPSEEK R1 RESPONSE
+# R1 produces <think>...</think> + final answer — we display BOTH
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _parse_r1_response(raw_text: str) -> tuple:
+    think_match    = re.search(r'<think>(.*?)</think>', raw_text, re.DOTALL)
+    thinking_chain = think_match.group(1).strip() if think_match else ""
+    final_report   = re.sub(r'<think>.*?</think>', '', raw_text, flags=re.DOTALL).strip()
+    return thinking_chain, final_report
+
+
+def _extract_risk_level(report_text: str) -> str:
+    for level in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]:
+        if level in report_text.upper():
+            return level
+    return "UNKNOWN"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UI COMPONENTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _risk_badge_html(risk_level: str) -> str:
+    colors = {
+        "CRITICAL": ("#FF4444", "rgba(255,68,68,0.12)",   "rgba(255,68,68,0.3)"),
+        "HIGH":     ("#F87171", "rgba(248,113,113,0.12)", "rgba(248,113,113,0.3)"),
+        "MEDIUM":   ("#FBBF24", "rgba(251,191,36,0.12)",  "rgba(251,191,36,0.3)"),
+        "LOW":      ("#34D399", "rgba(52,211,153,0.12)",  "rgba(52,211,153,0.3)"),
+        "UNKNOWN":  ("#7E9BB8", "rgba(126,155,184,0.12)", "rgba(126,155,184,0.3)"),
+    }
+    color, bg, border = colors.get(risk_level, colors["UNKNOWN"])
+    icons = {"CRITICAL": "🚨", "HIGH": "⚠️", "MEDIUM": "🔶", "LOW": "✅", "UNKNOWN": "❓"}
+    return f"""
+    <div style="background:{bg};border:2px solid {border};border-radius:12px;
+                padding:20px 28px;text-align:center;margin-bottom:20px;">
+        <div style="font-size:28px;margin-bottom:8px;">{icons.get(risk_level,'❓')}</div>
+        <div style="font-size:11px;color:#7E9BB8;text-transform:uppercase;
+                    letter-spacing:0.18em;font-weight:700;margin-bottom:4px;">
+            Overall AML Risk Level</div>
+        <div style="font-size:36px;font-weight:900;color:{color};
+                    letter-spacing:0.08em;font-family:'JetBrains Mono',monospace;">
+            {risk_level}</div>
+        <div style="font-size:10px;color:#4A6080;margin-top:8px;">
+            DeepSeek R1 Chain-of-Thought · {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}
+        </div>
+    </div>
+    """
+
+
+def _metric_card_html(label: str, value: str, sub: str, color: str = "#93C5FD") -> str:
+    return f"""
+    <div style="background:rgba(15,30,53,0.8);border:1px solid rgba(96,165,250,0.14);
+                border-radius:8px;padding:16px 18px;text-align:center;">
+        <div style="font-size:9px;color:#4A6080;text-transform:uppercase;
+                    letter-spacing:0.12em;font-weight:700;margin-bottom:6px;">{label}</div>
+        <div style="font-size:22px;font-weight:800;color:{color};
+                    font-family:'JetBrains Mono',monospace;">{value}</div>
+        <div style="font-size:10px;color:#4A6080;margin-top:4px;">{sub}</div>
+    </div>
+    """
+
+
+def _render_portfolio_metrics(systemic_df: pd.DataFrame):
+    if systemic_df.empty:
+        return
+    r = systemic_df.iloc[0]
+    cols = st.columns(5)
+    metrics = [
+        ("Flagged Accounts",     f"{int(r.get('total_flagged_accounts',0)):,}",
+         "in investigation queue",    "#93C5FD"),
+        ("Confirmed Laundering", f"{int(r.get('confirmed_laundering_accounts',0)):,}",
+         "ground-truth positive",     "#F87171"),
+        ("SAR Eligible",         f"{int(r.get('sar_eligible_accounts',0)):,}",
+         "meet filing threshold",     "#FBBF24"),
+        ("Total Exposure",       f"${float(r.get('total_exposure_usd',0))/1e6:.1f}M",
+         "USD at risk",               "#A78BFA"),
+        ("High-Value Wires",     f"{int(r.get('total_high_value_wires',0)):,}",
+         "integration signals",       "#34D399"),
+    ]
+    for col, (label, value, sub, color) in zip(cols, metrics):
+        with col:
+            st.markdown(_metric_card_html(label, value, sub, color), unsafe_allow_html=True)
+
+
+def _render_typology_table(typology_df: pd.DataFrame):
+    if typology_df.empty:
+        return
+    st.markdown(
+        '<div style="font-size:9px;letter-spacing:0.14em;text-transform:uppercase;'
+        'color:#4A6080;margin-bottom:10px;font-weight:700;">AML Typology Evidence Matrix</div>',
+        unsafe_allow_html=True,
+    )
+    typology_colors = {
+        "Integration": "#F87171",
+        "Layering":    "#FBBF24",
+        "Structuring": "#A78BFA",
+        "Placement":   "#60A5FA",
+        "Unknown":     "#4A6080",
+    }
+    rows_html = ""
+    for _, r in typology_df.iterrows():
+        typology = str(r.get("aml_typology", "Unknown"))
+        color    = typology_colors.get(typology, "#4A6080")
+        rate     = float(r.get("laundering_rate_pct", 0))
+        bar_pct  = min(rate * 200, 100)
+        rows_html += f"""
+        <tr style="border-bottom:1px solid rgba(96,165,250,0.05);">
+            <td style="padding:10px 12px;color:#93C5FD;font-size:12px;font-weight:600;">
+                {r.get('payment_format','?')}</td>
+            <td style="padding:10px 12px;">
+                <span style="background:rgba(255,255,255,0.04);color:{color};
+                             font-size:10px;font-weight:700;padding:2px 8px;border-radius:3px;
+                             border:1px solid {color}40;letter-spacing:0.08em;">
+                    {typology}</span></td>
+            <td style="padding:10px 12px;color:#FFFFFF;font-family:monospace;font-size:12px;">
+                {int(r.get('total_transactions',0)):,}</td>
+            <td style="padding:10px 12px;color:#F87171;font-family:monospace;font-size:12px;">
+                {int(r.get('laundering_count',0)):,}</td>
+            <td style="padding:10px 12px;min-width:160px;">
+                <div style="display:flex;align-items:center;gap:8px;">
+                    <div style="flex:1;height:6px;background:rgba(255,255,255,0.05);border-radius:3px;">
+                        <div style="width:{bar_pct:.1f}%;height:100%;background:{color};
+                                    border-radius:3px;opacity:0.85;"></div></div>
+                    <span style="font-family:monospace;font-size:11px;color:{color};
+                                 font-weight:700;white-space:nowrap;">{rate:.4f}%</span>
+                </div></td>
+        </tr>"""
+    st.markdown(
+        f"""<div style="background:#0F1E35;border:1px solid rgba(96,165,250,0.12);
+                        border-radius:8px;overflow:hidden;">
+            <table style="width:100%;border-collapse:collapse;">
+                <thead><tr style="border-bottom:1px solid rgba(96,165,250,0.2);
+                                  background:rgba(96,165,250,0.04);">
+                    <th style="padding:10px 12px;text-align:left;font-size:9px;color:#4A6080;
+                               text-transform:uppercase;letter-spacing:0.1em;">Payment Format</th>
+                    <th style="padding:10px 12px;text-align:left;font-size:9px;color:#4A6080;
+                               text-transform:uppercase;letter-spacing:0.1em;">AML Typology</th>
+                    <th style="padding:10px 12px;text-align:left;font-size:9px;color:#4A6080;
+                               text-transform:uppercase;letter-spacing:0.1em;">Transactions</th>
+                    <th style="padding:10px 12px;text-align:left;font-size:9px;color:#4A6080;
+                               text-transform:uppercase;letter-spacing:0.1em;">Laundering Count</th>
+                    <th style="padding:10px 12px;text-align:left;font-size:9px;color:#4A6080;
+                               text-transform:uppercase;letter-spacing:0.1em;">Rate</th>
+                </tr></thead>
+                <tbody>{rows_html}</tbody>
+            </table></div>""",
+        unsafe_allow_html=True,
+    )
+
+
+def _thinking_chain_renderer(thinking: str):
+    """
+    Render DeepSeek R1 thinking chain as styled expander.
+    This is the regulatory audit trail — showing AI reasoning, not hiding it.
+    """
+    if not thinking:
+        return
+    with st.expander("🧠 DeepSeek R1 Reasoning Chain (Regulatory Audit Trail)", expanded=False):
+        st.markdown(
+            """<div style="background:rgba(15,30,53,0.6);border-left:3px solid #60A5FA;
+                          border-radius:4px;padding:12px 16px;margin-bottom:12px;">
+                <div style="font-size:11px;color:#7E9BB8;font-weight:600;">
+                    What you are seeing: DeepSeek R1 chain-of-thought reasoning before its conclusion.
+                </div>
+                <div style="font-size:11px;color:#4A6080;margin-top:4px;">
+                    In AML compliance, explainable AI is a regulatory requirement. Institutions must
+                    demonstrate WHY a transaction was flagged, not just that it was. This thinking
+                    chain serves as the machine-readable audit trail for regulatory review.
+                </div></div>""",
+            unsafe_allow_html=True,
+        )
+        st.code(thinking, language=None)
+
+
+def _market_correlation_chart(market_df: pd.DataFrame):
+    """Laundering intensity vs market stress days — the IBM AML unique chart."""
+    if market_df.empty:
+        return
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+    except ImportError:
+        st.info("Install plotly: pip install plotly")
+        st.dataframe(
+            market_df[[
+                "transaction_date", "laundering_count",
+                "laundering_intensity_vs_10d_avg",
+                "jpm_daily_return_pct", "gs_daily_return_pct",
+                "is_market_stress_day"
+            ]].set_index("transaction_date"),
+            use_container_width=True,
+        )
+        return
+
+    dates      = market_df["transaction_date"].astype(str).tolist()
+    intensity  = market_df["laundering_intensity_vs_10d_avg"].fillna(1.0).tolist()
+    jpm        = market_df["jpm_daily_return_pct"].fillna(0).tolist()
+    gs         = market_df["gs_daily_return_pct"].fillna(0).tolist()
+    stress     = market_df["is_market_stress_day"].tolist()
+
+    fig = make_subplots(
+        rows=2, cols=1,
+        subplot_titles=(
+            "Laundering Intensity vs 10-Day Average (red = banking stress day)",
+            "Banking Sector Performance — JPM & GS Daily Return %",
+        ),
+        vertical_spacing=0.18,
+        shared_xaxes=True,
+    )
+
+    bar_colors = ["#F87171" if s else "#60A5FA" for s in stress]
+    fig.add_trace(go.Bar(
+        x=dates, y=intensity,
+        name="Laundering Intensity",
+        marker_color=bar_colors, opacity=0.85,
+    ), row=1, col=1)
+    fig.add_hline(
+        y=1.0, line_dash="dot",
+        line_color="rgba(255,255,255,0.3)",
+        annotation_text="Baseline 1.0x",
+        row=1, col=1,
+    )
+    fig.add_trace(go.Scatter(
+        x=dates, y=jpm,
+        name="JPM Daily Return %",
+        line=dict(color="#60A5FA", width=2),
+        mode="lines+markers",
+    ), row=2, col=1)
+    fig.add_trace(go.Scatter(
+        x=dates, y=gs,
+        name="GS Daily Return %",
+        line=dict(color="#A78BFA", width=2, dash="dot"),
+        mode="lines+markers",
+    ), row=2, col=1)
+    fig.add_hline(y=0, line_dash="dash", line_color="rgba(255,255,255,0.2)", row=2, col=1)
+
+    fig.update_layout(
+        plot_bgcolor="#0F1E35", paper_bgcolor="#0F1E35",
+        font=dict(color="#7E9BB8", size=11),
+        legend=dict(bgcolor="rgba(15,30,53,0.8)",
+                    bordercolor="rgba(96,165,250,0.2)", borderwidth=1),
+        margin=dict(l=40, r=20, t=50, b=40),
+        height=480,
+    )
+    fig.update_xaxes(gridcolor="rgba(96,165,250,0.05)", showgrid=True)
+    fig.update_yaxes(gridcolor="rgba(96,165,250,0.05)", showgrid=True)
+
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption(
+        "🔴 Red bars = market stress days (JPM & GS both negative return). "
+        "Bars above 1.0x = laundering above 10-day rolling average. "
+        "Overlap confirms coordinated capital flight hypothesis."
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_risk_assessment(agent1_results: list, agent2_context: dict = None):
+    """
+    Main Agent 3 render function.
+    Called from app.py with:
+      agent1_results  — scored transactions from Isolation Forest (Agent 1)
+      agent2_context  — st.session_state.agent2_context from Agent 2 handoff
+    """
+    try:
+        client = _get_deepseek_client()
+    except Exception as e:
+        st.error(f"DeepSeek R1 initialisation failed: {e}")
+        st.info("Add OPENROUTER_API_KEY to your .env file.")
+        return
+
+    # Page header
+    st.markdown(
+        """<div style="margin-bottom:24px;">
+            <div style="font-size:9px;letter-spacing:0.2em;text-transform:uppercase;
+                        color:#4A6080;font-weight:700;margin-bottom:4px;">
+                Agent 3 · DeepSeek R1 · Chain-of-Thought Reasoning</div>
+            <div style="font-size:22px;font-weight:800;color:#FFFFFF;">
+                Risk Assessment &amp; Regulatory Decision Engine</div>
+            <div style="font-size:13px;color:#7E9BB8;margin-top:6px;line-height:1.6;">
+                Systemic AML risk classification across all flagged accounts.
+                Receives Agent 2 investigation findings and produces formal regulatory
+                outputs with visible reasoning chain audit trail.
+            </div></div>""",
+        unsafe_allow_html=True,
+    )
+
+    # Agent 2 handoff status
+    if agent2_context:
+        acct  = agent2_context.get("selected_account", "Unknown")
+        turns = len(agent2_context.get("full_history", []))
+        st.success(
+            f"✅ Agent 2 handoff received — "
+            f"Account **{acct}** investigated over **{turns} conversation turns**. "
+            f"Proceeding with systemic risk assessment."
+        )
+    else:
+        st.info(
+            "ℹ️ No Agent 2 context found. Running standalone batch assessment. "
+            "Investigate an account in Agent 2 first for richer context."
+        )
+
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+    # Load all Gold data
+    with st.spinner("Loading Gold layer data from Databricks..."):
+        systemic_df  = _fetch_systemic_risk_summary()
+        typology_df  = _fetch_typology_breakdown()
+        market_df    = _fetch_market_stress_correlation()
+        entity_df    = _fetch_entity_risk_distribution()
+        corridors_df = _fetch_hottest_corridors()
+
+    # Portfolio KPIs
+    st.markdown(
+        '<div style="font-size:9px;letter-spacing:0.14em;text-transform:uppercase;'
+        'color:#4A6080;margin-bottom:12px;font-weight:700;">Portfolio Risk Exposure</div>',
+        unsafe_allow_html=True,
+    )
+    _render_portfolio_metrics(systemic_df)
+
+    st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+
+    # AML Typology Table
+    _render_typology_table(typology_df)
+
+    st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+
+    # Market Correlation Chart
+    st.markdown(
+        '<div style="font-size:9px;letter-spacing:0.14em;text-transform:uppercase;'
+        'color:#4A6080;margin-bottom:6px;font-weight:700;">'
+        'Laundering Intensity vs Market Stress (IBM AML Unique Analysis)</div>',
+        unsafe_allow_html=True,
+    )
+    _market_correlation_chart(market_df)
+
+    st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
+
+    # DeepSeek R1 Assessment
+    st.markdown(
+        '<div style="font-size:9px;letter-spacing:0.14em;text-transform:uppercase;'
+        'color:#4A6080;margin-bottom:12px;font-weight:700;">'
+        'DeepSeek R1 Risk Assessment Report</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Cache in session state — avoid re-running on every Streamlit interaction
+    cache_key = f"agent3_report_{hash(str(agent2_context))}"
+
+    col_run, col_clear = st.columns([2, 6])
+    with col_run:
+        run_clicked = st.button("🧠 Run Risk Assessment", type="primary", use_container_width=True)
+    with col_clear:
+        if st.button("🗑 Clear Cached Report", use_container_width=True):
+            if cache_key in st.session_state:
+                del st.session_state[cache_key]
+            st.rerun()
+
+    if run_clicked or cache_key in st.session_state:
+        if run_clicked or cache_key not in st.session_state:
+            # Build context dossier
+            context = _build_assessment_context(
+                agent2_context=agent2_context,
+                systemic_df=systemic_df,
+                typology_df=typology_df,
+                market_df=market_df,
+                entity_df=entity_df,
+                corridors_df=corridors_df,
+            )
+
+            # Call DeepSeek R1
+            with st.spinner("🧠 DeepSeek R1 reasoning... (20-40 seconds — chain-of-thought model)"):
+                try:
+                    start_time = time.time()
+                    response = client.chat.completions.create(
+                        model="deepseek/deepseek-r1",
+                        messages=[
+                            {"role": "system", "content": _SYSTEM_PROMPT},
+                            {"role": "user",   "content": context},
+                        ],
+                        temperature=0.1,
+                        max_tokens=4000,
+                    )
+                    elapsed   = time.time() - start_time
+                    raw_text  = response.choices[0].message.content or ""
+
+                    thinking_chain, final_report = _parse_r1_response(raw_text)
+                    risk_level = _extract_risk_level(final_report)
+
+                    st.session_state[cache_key] = {
+                        "thinking_chain": thinking_chain,
+                        "final_report":   final_report,
+                        "risk_level":     risk_level,
+                        "elapsed":        elapsed,
+                        "timestamp":      datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+                except Exception as e:
+                    st.error(f"DeepSeek R1 API error: {e}")
+                    return
+
+        # Render from cache
+        result         = st.session_state[cache_key]
+        thinking_chain = result["thinking_chain"]
+        final_report   = result["final_report"]
+        risk_level     = result["risk_level"]
+        elapsed        = result["elapsed"]
+
+        # Risk badge
+        st.markdown(_risk_badge_html(risk_level), unsafe_allow_html=True)
+
+        # Reasoning chain — audit trail
+        _thinking_chain_renderer(thinking_chain)
+
+        # Final report
+        st.markdown(
+            """<div style="background:rgba(15,30,53,0.6);border:1px solid rgba(96,165,250,0.14);
+                           border-radius:8px;padding:6px 16px;margin-bottom:16px;">
+                <div style="font-size:9px;color:#4A6080;text-transform:uppercase;
+                            letter-spacing:0.12em;margin-bottom:4px;font-weight:700;">
+                    Formal Risk Assessment Report</div></div>""",
+            unsafe_allow_html=True,
+        )
+        st.markdown(final_report)
+
+        # Metadata footer
+        st.markdown(
+            f"""<div style="margin-top:24px;padding:12px 16px;background:rgba(15,30,53,0.4);
+                            border-radius:6px;border:1px solid rgba(96,165,250,0.08);">
+                <div style="display:flex;gap:24px;flex-wrap:wrap;">
+                    <span style="font-size:10px;color:#4A6080;">🤖 Model: deepseek/deepseek-r1 via OpenRouter</span>
+                    <span style="font-size:10px;color:#4A6080;">⏱ Generation: {elapsed:.1f}s</span>
+                    <span style="font-size:10px;color:#4A6080;">🕐 {result['timestamp']}</span>
+                    <span style="font-size:10px;color:#4A6080;">📊 IBM AML · 5,078,316 transactions · Sep 2022</span>
+                </div></div>""",
+            unsafe_allow_html=True,
+        )
+
+        # Save output for Agent 4 handoff
+        agent3_output = {
+            "risk_level":     risk_level,
+            "thinking_chain": thinking_chain,
+            "final_report":   final_report,
+            "timestamp":      result["timestamp"],
+            "agent2_account": agent2_context.get("selected_account") if agent2_context else None,
+        }
+        st.session_state["agent3_output"] = agent3_output
+
+        output_dir  = _PROJECT_ROOT / "data" / "ai_reports"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        report_path = output_dir / f"agent3_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        with open(report_path, "w") as f:
+            json.dump(agent3_output, f, indent=2)
+
+        st.success(
+            f"✅ Report saved to `{report_path.name}` — "
+            f"`st.session_state.agent3_output` ready for Agent 4."
+        )
+    else:
+        st.markdown(
+            """<div style="background:rgba(15,30,53,0.6);border:1px solid rgba(96,165,250,0.12);
+                           border-radius:8px;padding:24px 28px;text-align:center;">
+                <div style="font-size:28px;margin-bottom:12px;">🧠</div>
+                <div style="font-size:14px;font-weight:700;color:#FFFFFF;margin-bottom:6px;">
+                    Ready to run systemic risk assessment</div>
+                <div style="font-size:12px;color:#7E9BB8;line-height:1.7;">
+                    Click <strong>Run Risk Assessment</strong> above to start DeepSeek R1.<br>
+                    The reasoning chain will be shown as a regulatory audit trail.<br>
+                    Takes 20-40 seconds — the model thinks before it concludes.
+                </div></div>""",
+            unsafe_allow_html=True,
+        )
